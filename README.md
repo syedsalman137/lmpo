@@ -1,1 +1,1 @@
-# lmpo
+# Language Model Policy Optimization
