@@ -21,11 +21,11 @@ def pad_and_collate(token_batch, pad_id=0, multi_host=False, force_length=None):
     return np.array([(max_len - len(x)) * [pad_id] + x for x in token_batch])
 
 # @partial(jax.jit, out_shardings=(None), static_argnames=('model'))
-def get_logprobs(model: Qwen3Model, params, token_batch, cache):
+def get_logprobs(model: Qwen3Model, params, token_batch, cache, historic_x):
     print("JIT compiling update function for token_batch of shape", token_batch.shape)
     text_input, text_target = token_batch[:, :-1], token_batch[:, 1:]
     token_mask = jnp.where(text_input != 0, 1, 0).astype(jnp.int32)
-    logits, _ = model.apply({'params': params}, text_input, token_mask, cache=cache)
+    logits, _, _ = model.apply({'params': params}, text_input, token_mask, cache=cache, historic_x=historic_x)
     logprobs = jax.nn.log_softmax(logits, axis=-1) # [batch, time, vocab_size]
     logprobs = jnp.sum(logprobs * jax.nn.one_hot(text_target, logits.shape[-1]), axis=-1)
     return logprobs
@@ -66,7 +66,7 @@ def autoregressive_sample(model: Qwen3Model, params, prompt_tokens, num_generati
     # next input -> from p4, predict
 
     # Fill cache with the prompt tokens.
-    logits, cache = model_apply(params, prompt_tokens[:, :-1], token_mask[:, :-1], cache=cache)
+    logits, cache, _ = model_apply(params, prompt_tokens[:, :-1], token_mask[:, :-1], cache=cache)
     # logits, cache = model_apply(params, prompt_tokens[:, :-1], token_mask[:, :-1], cache=None)
 
     sampled_token = prompt_tokens[:, -1]  # Start with the last token of the prompt.
@@ -85,17 +85,17 @@ def autoregressive_sample(model: Qwen3Model, params, prompt_tokens, num_generati
     # logprobs_list.append(prompt_logprobs)
 
     max_samples = max_seq_len - prompt_tokens.shape[-1]
-    max_samples = 1
+    max_samples = 32
     for i in range(max_samples):
         next_token_mask = jnp.ones(sampled_token.shape, dtype=jnp.int32)
         print(" =============== Doing an autogressive step with cache.")
         print('cache k is', cache.k[27][0, 2])
-        logits, cache = model_apply(params, sampled_token[:, None], next_token_mask[:, None], cache=cache)
+        logits, cache, historic_x = model_apply(params, sampled_token[:, None], next_token_mask[:, None], cache=cache)
         print("============================")
         logits = logits[:, 0, :]
         key, rng = jax.random.split(rng)
-        # sampled_token = jax.random.categorical(key, logits, axis=-1) # [batch]
-        sampled_token = jnp.argmax(logits, axis=-1)  # [batch]
+        sampled_token = jax.random.categorical(key, logits, axis=-1) # [batch]
+        # sampled_token = jnp.argmax(logits, axis=-1)  # [batch]
 
         # Very ugly to support forcing a <answer> tag.
         if force_answer:
@@ -124,7 +124,7 @@ def autoregressive_sample(model: Qwen3Model, params, prompt_tokens, num_generati
     logprobs = jnp.stack(logprobs_list, axis=-1)
     logprobs = jnp.concatenate([prompt_logprobs, logprobs], axis=-1)  # [batch, time]
     print("=============== Recalculating with a blank cache. ")
-    logprobs_recalc = get_logprobs(model, params, jnp.concatenate([prompt_tokens, tokens], axis=-1), cache_blank)
+    logprobs_recalc = get_logprobs(model, params, jnp.concatenate([prompt_tokens, tokens], axis=-1), cache_blank, historic_x)
     print("============================")
 
 
