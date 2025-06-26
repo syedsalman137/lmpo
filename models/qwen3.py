@@ -82,7 +82,7 @@ class Block(nn.Module):
     eps: float = 1e-6
 
     @nn.compact
-    def __call__(self, x, sin, cos, token_mask, layer_id, cache=None, historic_x=None):
+    def __call__(self, x, sin, cos, token_mask, layer_id, cache=None):
 
         # =========================
         # === Self-Attention Block. 
@@ -138,40 +138,10 @@ class Block(nn.Module):
         qk = jnp.where(mask, qk, -1e30) # good
         attn = jax.nn.softmax(qk.astype(jnp.float32), axis=2) # on T dimension.
         attn = jnp.reshape(attn, (b, t, T, kh, qh // kh))
-        qkv = jnp.einsum("btThg,bThd->bthgd", attn, v)
+        qkv = jnp.einsum("btThg,bThd->bthgd", attn, v).astype(x.dtype)
         qkv = jnp.reshape(qkv, (b, t, qh*d))
-        attn_x = nn.Dense(self.hidden_size, use_bias=False, dtype=jnp.float32)(qkv, debug=(layer_id == 0))
-        attn_x = attn_x.astype(x.dtype)
-
-        # if layer_id == 2:
-        historics = {
-            'q': q[0, -1],
-            'x': x[0, -1],
-            'qkv': qkv[0, -1],
-            'attn_x': attn_x[0, -1],
-        }
-
-        # if historic_x is not None:
-        #     historic_old = historic_x[layer_id]
-        #     for key in historics:
-        #         if not jnp.array_equal(historics[key], historic_old[key]):
-        #             print(f'Layer {layer_id} historic mismatch for key {key}:')
-        #             print(f'Current: {historics[key]}')
-        #             print(f'Historic: {historic_old[key]}')
-        #             breakpoint()
-        #     print(f'layer{layer_id} x[0, -1]', x[0, -1])
-        #     print(f'layer{layer_id} q[0, -1]', q[0, -1])
-        #     # print(f'layer{layer_id} k[0, -1]', k[0, -1])
-        #     # print(f'layer{layer_id} v[0, -1]', v[0, -1])
-        #     print(f'layer{layer_id} q_idx[0, -1]', q_idx[0, -1])
-        #     print(f'layer{layer_id} k_idx[0, -1]', k_idx[0, -1])
-        #     print(f'layer{layer_id} qkv[0, -1]', qkv[0, -1])
-        #     print(f'layer{layer_id} attn_x[0, -1]', attn_x[0, -1])
-        #     # breakpoint()
-
+        attn_x = nn.Dense(self.hidden_size, use_bias=False, dtype=jnp.bfloat16)(qkv, debug=(layer_id == 0))
         x = x + attn_x
-
-        # print(f'layer{layer_id} attn_x[0, -1]', attn_x[0, -1])
         
         # =========================
         # === MLP Block. 
@@ -184,10 +154,7 @@ class Block(nn.Module):
         y = g * y
         mlp_x = nn.Dense(features=self.hidden_size, use_bias=False, dtype=jnp.bfloat16)(y)
         x = x + mlp_x
-
-        # print(f'layer{layer_id} mlp_x[0, -1]', mlp_x[0, -1])
-
-        return x, k, v, historics
+        return x, k, v
 
 class Qwen3Model(nn.Module):
     hidden_size: int
@@ -201,8 +168,7 @@ class Qwen3Model(nn.Module):
     eps: float = 1e-6
 
     @nn.compact
-    def __call__(self, x, token_mask, cache = None, historic_x=None):
-        print('Last token input is', x[0, -1])
+    def __call__(self, x, token_mask, cache = None):
         x = nn.Embed(num_embeddings=self.vocab_size, features=self.hidden_size)(x)
         x = x.astype(jnp.bfloat16)
         positions = get_positions(token_mask)
@@ -210,14 +176,11 @@ class Qwen3Model(nn.Module):
             start_indices = jnp.where(cache.length != 0, cache.length - cache.starts, 0)
         else:
             start_indices = jnp.zeros((x.shape[0],), dtype=jnp.int32)
-        jax.debug.print("Start indices: {x}", x=start_indices)
         positions = start_indices[:, None] + positions
         sin, cos = generate_pos_embeddings(positions, self.head_dim, self.rope_theta)
         sin, cos = sin.astype(jnp.bfloat16), cos.astype(jnp.bfloat16)
-        old_x = []
         for layer_id in range(self.num_layers):
-            x, k, v, historics = Block(hidden_size=self.hidden_size, q_heads=self.q_heads, kv_heads=self.kv_heads, head_dim=self.head_dim, mlp_ffw_size=self.mlp_ffw_size, eps=self.eps)(x, sin, cos, token_mask, layer_id, cache, historic_x=historic_x)
-            old_x.append(historics)
+            x, k, v = Block(hidden_size=self.hidden_size, q_heads=self.q_heads, kv_heads=self.kv_heads, head_dim=self.head_dim, mlp_ffw_size=self.mlp_ffw_size, eps=self.eps)(x, sin, cos, token_mask, layer_id, cache)
             if cache is not None:
                 cache.k[layer_id] = k
                 cache.v[layer_id] = v
@@ -229,7 +192,7 @@ class Qwen3Model(nn.Module):
         if cache is not None:
             cache = cache.replace(length=cache.length + jnp.max(length_minus_padding(token_mask)))
 
-        return logits, cache, old_x
+        return logits, cache
     
 ###############################
 ##### Utils for loading models.

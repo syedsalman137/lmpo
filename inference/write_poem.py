@@ -21,15 +21,15 @@ is_multi_host = len(jax.local_devices()) != len(jax.devices())
 ckpt_dir = '/nfs/gcs/jaxconverted/Qwen3-0.6B/'
 # ckpt_dir = '/nfs/gcs/jaxconverted/Qwen3-8B/'
 model, params = create_model_from_ckpt(ckpt_dir)
-# param_shard, no_shard, data_shard, shard_data_fn = create_sharding('fsdp', train_state_shape=params)
-param_shard, no_shard, data_shard, shard_data_fn = create_sharding('dp', train_state_shape=params)
+param_shard, no_shard, data_shard, shard_data_fn = create_sharding('fsdp', train_state_shape=params)
+# param_shard, no_shard, data_shard, shard_data_fn = create_sharding('dp', train_state_shape=params)
 params = jax.jit(lambda x: x, out_shardings=param_shard)(params)
 jax.debug.visualize_array_sharding(params['Block_0']['Dense_0']['kernel'])
 tokenizer = create_tokenizer(ckpt_dir)
 
 imagenet_labels = open('inference/imagenet_labels.txt').read().splitlines()
 # poem_prompts = [f'Write a haiku about of {imagenet_labels[np.random.randint(len(imagenet_labels))]}' for _ in range(len(jax.local_devices()))]
-poem_prompts = [f'Write a haiku about of cats.' for _ in range(len(jax.local_devices()))]
+poem_prompts = [f'Write a poem about cats.' for _ in range(len(jax.local_devices()))]
 
 pad_id = 0
 token_list = [
@@ -59,7 +59,7 @@ token_batch = shard_data_fn(token_batch)
 print("Input tokens global:", token_batch.shape)
 num_generation_tokens = 32
 rng = jax.random.PRNGKey(0)
-tokens_out, _ = autoregressive_sample(
+tokens_out = autoregressive_sample(
     model, params, token_batch, rng=rng, num_generation_tokens=num_generation_tokens, pad_id=pad_id, data_shard=data_shard, no_shard=no_shard, force_answer=True
 )
 if is_multi_host:
