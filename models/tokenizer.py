@@ -6,6 +6,25 @@ from transformers import PreTrainedTokenizerFast, AddedToken
 # This is mostly a sanity checking file, it just wraps PreTrainedTokenizerFast, but I want to know what it is doing.
 #############################
 
+class Tokenizer():
+    def __init__(self, hf_tokenizer):
+        self.hf_tokenizer = hf_tokenizer
+
+    def apply_chat_template(self, messages, add_generation_prompt=False, enable_thinking=False):
+        toks = self.hf_tokenizer.apply_chat_template(messages, add_generation_prompt=add_generation_prompt, enable_thinking=enable_thinking)
+        if enable_thinking:
+            toks += [151667] # <think>.
+        return toks
+    
+    def get_eos_token_id(self):
+        return self.hf_tokenizer.eos_token_id
+    
+    def decode(self, toks):
+        return self.hf_tokenizer.decode(toks)
+    
+    def encode(self, text):
+        return self.hf_tokenizer.encode(text)
+
 def create_tokenizer(dir):
     config = json.loads(Path(dir+'tokenizer_config.json').read_text())
     config = {
@@ -15,6 +34,7 @@ def create_tokenizer(dir):
         int(k): AddedToken(**v) for (k, v) in config.get("added_tokens_decoder", dict()).items()
     }
     tokenizer = PreTrainedTokenizerFast(tokenizer_file=str(dir+'tokenizer.json'), **config)
+    tokenizer = Tokenizer(tokenizer)
     return tokenizer
 
 if __name__ == "__main__":

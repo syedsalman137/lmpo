@@ -142,7 +142,20 @@ class Block(nn.Module):
         qkv = jnp.reshape(qkv, (b, t, qh*d))
         attn_x = nn.Dense(self.hidden_size, use_bias=False, dtype=jnp.bfloat16)(qkv)
 
+        if layer_id == 2:
+            print(f'layer{layer_id} x[0, -1]', x[0, -1])
+            print(f'layer{layer_id} q[0, -1]', q[0, -1])
+            print(f'layer{layer_id} k[0, -1]', k[0, -1])
+            print(f'layer{layer_id} v[0, -1]', v[0, -1])
+            print(f'layer{layer_id} q_idx[0, -1]', q_idx[0, -1])
+            print(f'layer{layer_id} k_idx[0, -1]', k_idx[0, -1])
+            print(f'layer{layer_id} qkv[0, -1]', qkv[0, -1])
+            print(f'layer{layer_id} attn_x[0, -1]', attn_x[0, -1])
+            breakpoint()
+
         x = x + attn_x
+
+        # print(f'layer{layer_id} attn_x[0, -1]', attn_x[0, -1])
         
         # =========================
         # === MLP Block. 
@@ -155,6 +168,8 @@ class Block(nn.Module):
         y = g * y
         mlp_x = nn.Dense(features=self.hidden_size, use_bias=False, dtype=jnp.bfloat16)(y)
         x = x + mlp_x
+
+        # print(f'layer{layer_id} mlp_x[0, -1]', mlp_x[0, -1])
 
         return x, k, v
 
@@ -171,6 +186,7 @@ class Qwen3Model(nn.Module):
 
     @nn.compact
     def __call__(self, x, token_mask, cache = None):
+        print('Last token input is', x[0, -1])
         x = nn.Embed(num_embeddings=self.vocab_size, features=self.hidden_size)(x)
         x = x.astype(jnp.bfloat16)
         positions = get_positions(token_mask)
@@ -178,6 +194,7 @@ class Qwen3Model(nn.Module):
             start_indices = jnp.where(cache.length != 0, cache.length - cache.starts, 0)
         else:
             start_indices = jnp.zeros((x.shape[0],), dtype=jnp.int32)
+        jax.debug.print("Start indices: {x}", x=start_indices)
         positions = start_indices[:, None] + positions
         sin, cos = generate_pos_embeddings(positions, self.head_dim, self.rope_theta)
         sin, cos = sin.astype(jnp.bfloat16), cos.astype(jnp.bfloat16)
@@ -216,7 +233,8 @@ def create_model_from_hf(hf_dir: str):
     )
     tokens = jnp.ones((1,1), dtype=jnp.int32)
     idx = jnp.ones((1,1), dtype=jnp.int32)
-    params = model.init(jax.random.PRNGKey(0), tokens, idx)['params']
+    # params = model.init(jax.random.PRNGKey(0), tokens, idx)['params']
+    params = jax.eval_shape(model.init, jax.random.PRNGKey(0), tokens, idx)['params']
 
     _HF_KEY_MAPPING = {
         r"model\.embed_tokens\.weight": "Embed_0.embedding",
@@ -260,9 +278,13 @@ def create_model_from_hf(hf_dir: str):
                     jax_key = jax_key_list.pop(0)
                     if len(jax_key_list) == 0:
                         if 'kernel' in jax_key:
-                            new_param = jnp.array(torch_params[key].float()).T
+                            new_param = torch_params[key].float().T.numpy()
+                            # new_param = jnp.array(torch_params[key].float()).T
+                            # new_param = jax.device_put(torch_params[key].float(), device=jax.devices("cpu")[0]).T
                         else:
-                            new_param = jnp.array(torch_params[key].float())
+                            new_param = torch_params[key].float().numpy()
+                            # new_param = jnp.array(torch_params[key].float())
+                            # new_param = jax.device_put(torch_params[key].float(), device=jax.devices("cpu")[0]).T
                         assert new_param.shape == jax_param[jax_key].shape
                         jax_param[jax_key] = new_param
                     jax_param = jax_param[jax_key]

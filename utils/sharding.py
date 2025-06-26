@@ -27,7 +27,14 @@ def create_sharding(shard_type, train_state_shape=None):
             min_size_to_shard_mb = 4
             if np.prod(shape) * param.dtype.itemsize <= min_size_to_shard_mb * (2 ** 20):
                 return all_nones
-            idx = np.argsort(shape)[::-1]
+            
+            # idx = np.argsort(shape)[::-1]
+            idx = np.arange(len(shape))
+            # This is neccessary to prevent numerical sharding issues. I cannot explain why.
+            # But if params are sharded as (None, 'device'), it causes issues when doing
+            # input @ params, when input is sharded with ['devices', None].
+
+
             for i in idx:
                 if shape[i] % jax.device_count() == 0:
                     return all_nones[:i] + ('devices',) + all_nones[i+1:]

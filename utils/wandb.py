@@ -12,6 +12,11 @@ import time
 import numpy as np
 import os
 
+wandb_config = ml_collections.ConfigDict({
+    'project': "lmpo",
+    'name': 'lmpo-run',
+    'entity': FieldReference(None, field_type=str),
+})
 
 def get_flag_dict():
     flag_dict = {k: getattr(flags.FLAGS, k) for k in flags.FLAGS}
@@ -19,8 +24,6 @@ def get_flag_dict():
         if isinstance(flag_dict[k], ml_collections.ConfigDict):
             flag_dict[k] = flag_dict[k].to_dict()
     return flag_dict
-
-
 
 def setup_wandb(hyperparam_dict, entity=None, project="jaxtransformer", group=None, name=None,
     unique_identifier="", offline=False, random_delay=0, run_id='None', **additional_init_kwargs):

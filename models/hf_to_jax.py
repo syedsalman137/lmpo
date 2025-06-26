@@ -9,8 +9,12 @@ from transformers import PreTrainedTokenizerFast, AddedToken
 from utils.checkpoint import Checkpoint
 import shutil
 
-hf_dir = '/nfs/hf/Qwen--Qwen3-0.6B/'
-ckpt_dir = '/nfs/gcs/jaxconverted/Qwen3-0.6B/'
+# hf_dir = '/nfs/hf/Qwen--Qwen3-0.6B/'
+# ckpt_dir = '/nfs/gcs/jaxconverted/Qwen3-0.6B/'
+# hf_dir = '/nfs/gcs/checkpoints/hf/Qwen--Qwen3-8B/'
+# ckpt_dir = '/nfs/gcs/jaxconverted/Qwen3-8B/'
+hf_dir = '/nfs/hf/Qwen--Qwen3-1.7B/'
+ckpt_dir = '/nfs/gcs/jaxconverted/Qwen3-1.7B/'
 
 model, params = create_model_from_hf(hf_dir)
 ckpt = Checkpoint(ckpt_dir+'params.pkl', parallel=False)
