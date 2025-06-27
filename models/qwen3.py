@@ -121,7 +121,7 @@ class Block(nn.Module):
         # Causal Attention Mask.
         b, t, qh, d = q.shape # qh = 16
         _, T, kh, _ = k.shape # kh = 8
-        mask = q_idx[:, :, None] == k_idx[:, None, :]
+        mask = q_idx[:, :, None] & k_idx[:, None, :]
         mask = mask[:, None, :, :] # [B, 1, t, T]
         qk_size = (1, 1, t, T)
         q_iota = jax.lax.broadcasted_iota(jnp.int32, qk_size, 2)
@@ -140,7 +140,7 @@ class Block(nn.Module):
         attn = jnp.reshape(attn, (b, t, T, kh, qh // kh))
         qkv = jnp.einsum("btThg,bThd->bthgd", attn, v).astype(x.dtype)
         qkv = jnp.reshape(qkv, (b, t, qh*d))
-        attn_x = nn.Dense(self.hidden_size, use_bias=False, dtype=jnp.bfloat16)(qkv, debug=(layer_id == 0))
+        attn_x = nn.Dense(self.hidden_size, use_bias=False, dtype=jnp.bfloat16)(qkv)
         x = x + attn_x
         
         # =========================

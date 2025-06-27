@@ -20,16 +20,6 @@ def pad_and_collate(token_batch, pad_id=0, multi_host=False, force_length=None):
         max_len = force_length
     return np.array([(max_len - len(x)) * [pad_id] + x for x in token_batch])
 
-# @partial(jax.jit, out_shardings=(None), static_argnames=('model'))
-# def get_logprobs(model: Qwen3Model, params, token_batch, cache):
-#     print("JIT compiling update function for token_batch of shape", token_batch.shape)
-#     text_input, text_target = token_batch[:, :-1], token_batch[:, 1:]
-#     token_mask = jnp.where(text_input != 0, 1, 0).astype(jnp.int32)
-#     logits, _, = model.apply({'params': params}, text_input, token_mask, cache=cache)
-#     logprobs = jax.nn.log_softmax(logits, axis=-1) # [batch, time, vocab_size]
-#     logprobs = jnp.sum(logprobs * jax.nn.one_hot(text_target, logits.shape[-1]), axis=-1)
-#     return logprobs
-
 model_apply = None # Global variable to cache the JIT-compiled model application function.
 def autoregressive_sample(model: Qwen3Model, params, prompt_tokens, num_generation_tokens, rng, pad_id=0, data_shard=None, no_shard=None, force_answer=False):
     """
@@ -42,13 +32,12 @@ def autoregressive_sample(model: Qwen3Model, params, prompt_tokens, num_generati
     batch_size = prompt_tokens.shape[0]
     # pad_to = 2 ** math.ceil(math.log2((prompt_tokens.shape[-1])))
     pad_to = 256
-    # pad_to = 64
     prompt_tokens = jnp.pad(prompt_tokens, [(0, 0), (0, pad_to - prompt_tokens.shape[-1])])
     token_mask = jnp.where(prompt_tokens != pad_id, 1, 0).astype(jnp.int32)
     max_seq_len = pad_to + num_generation_tokens
 
     cache = KVCache.create(model.num_layers, batch_size, max_seq_len, model.head_dim, model.kv_heads)
-    cache = cache.replace(starts=count_left_padding(prompt_tokens, pad_id=0))
+    cache = cache.replace(starts=count_left_padding(prompt_tokens, pad_id=pad_id))
     cache_sharding = KVCache.get_sharding(data_shard, no_shard)
     cache = jax.jit(lambda x: x, out_shardings=cache_sharding)(cache)
 
@@ -64,7 +53,6 @@ def autoregressive_sample(model: Qwen3Model, params, prompt_tokens, num_generati
     tokens_list = []
 
     max_samples = max_seq_len - prompt_tokens.shape[-1]
-    max_samples = 32
     for i in range(max_samples):
         next_token_mask = jnp.ones(sampled_token.shape, dtype=jnp.int32)
         logits, cache = model_apply(params, sampled_token[:, None], next_token_mask[:, None], cache=cache)

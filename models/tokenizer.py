@@ -19,6 +19,9 @@ class Tokenizer():
     def get_eos_token_id(self):
         return self.hf_tokenizer.eos_token_id
     
+    def get_pad_token_id(self):
+        return 151643
+    
     def decode(self, toks):
         return self.hf_tokenizer.decode(toks)
     
