@@ -11,6 +11,7 @@ from functools import partial
 import wandb
 import ml_collections
 import sys
+import time
 from absl import app, flags
 
 from jax.experimental.compilation_cache import compilation_cache as cc
@@ -34,15 +35,17 @@ config = ml_collections.ConfigDict({
     # env settings.
     'env_name': 'poem',
     'num_generation_tokens': -1, # Use default from env.
+    'inference_batch_per_device': 4,
     # training settings.
-    'groups_per_batch': 128, # for global batch, multiply by group_size.
+    'groups_per_batch': 64, # for global batch, multiply by group_size.
     'ppo_minibatch': 64,
-    'group_size': 8,
+    'group_size': 8, # GRPO group size.
     'do_group_normalization': 1,
     'do_global_normalization': 0,
-    'do_group_filter': 1,
+    'do_group_filter': 1, # Filter for groups with all advantages == 0.
     'lr': 1e-6,
     'clip_epsilon': 0.2,
+    'entropy_coef': 0.001,
 })
 define_flag_dict(config)
 FLAGS = flags.FLAGS
@@ -104,6 +107,7 @@ def update(train_state: TrainState, token_batch, mask, advantages, old_logprobs)
         logits, _ = train_state.call_model(text_input, token_mask, cache=None, params=grad_params)
         logprobs = jax.nn.log_softmax(logits) # [batch, time, vocab_size]
         token_logprobs = jnp.sum(logprobs * jax.nn.one_hot(text_target, logits.shape[-1]), axis=-1)
+        entropy = -jnp.sum(jax.nn.softmax(logits) * logprobs, axis=-1)
 
         # PPO loss.
         logratio = token_logprobs - old_logprobs
@@ -117,19 +121,21 @@ def update(train_state: TrainState, token_batch, mask, advantages, old_logprobs)
         importance_ratio = avg_over_mask(ratio)
         importance_ratio_mag = avg_over_mask(jnp.abs(1 - ratio))
         approx_kl = avg_over_mask((ratio - 1) - logratio)
-        entropy = avg_over_mask(-jnp.sum(jax.nn.softmax(logits) * logprobs, axis=-1))
+        entropy_avg = avg_over_mask(entropy, axis=-1)
         clip_fracs = avg_over_mask(jnp.abs(ratio - 1.0) > FLAGS.clip_epsilon)
         cross_entropy = avg_over_mask(-token_logprobs)
 
-        # jax.debug.breakpoint()
-
-        loss = jnp.mean(pg_loss * mask)  # Average over the batch and time steps.
+        loss_pg = jnp.mean(pg_loss * mask)
+        loss_ent = jnp.mean(entropy_avg * mask) * FLAGS.entropy_coef
+        loss = loss_pg + loss_ent
         return loss, {
             'loss': loss,
+            'loss_pg': loss_pg,
+            'loss_ent': loss_ent,
             'advantages': jnp.mean(advantages),
             'advantages_magnitude': jnp.mean(jnp.abs(advantages)),
             'nonzero_advantages': jnp.mean(advantages != 0),
-            'entropy_per_token': entropy,
+            'entropy_per_token': entropy_avg,
             'approx_kl': approx_kl,
             'clip_fraction': clip_fracs,
             'cross_entropy': cross_entropy,
@@ -153,7 +159,7 @@ def update(train_state: TrainState, token_batch, mask, advantages, old_logprobs)
     )
     return train_state, info
 
-rollout_batch_size = jax.local_device_count()
+rollout_batch_size = jax.local_device_count() * FLAGS.inference_batch_per_device
 assert rollout_batch_size % FLAGS.group_size == 0
 rng = jax.random.PRNGKey(jax.process_index())
 
@@ -166,6 +172,7 @@ for i in tqdm.tqdm(range(10000)):
     env_infos_history = {}
     env_infos_history['return'] = []
     num_rollout_iters = 0
+    rollout_start_time = time.time()
     while len(buffer_tokens) < FLAGS.groups_per_batch:
         num_rollout_iters += 1
         env_states, env_tokens = [], []
@@ -228,6 +235,8 @@ for i in tqdm.tqdm(range(10000)):
             print("Rollout returns:", returns)
             print("Rollout advantages:", advantages_grouped)
 
+    rollout_total_time = time.time() - rollout_start_time
+
     def ppo_shard(x):
         """Helper function that takes a local buffer, shards across devices, then splits into PPO minibatches."""
         host_id = jax.process_index()
@@ -270,10 +279,13 @@ for i in tqdm.tqdm(range(10000)):
         info = jax.tree.map(lambda x: x.mean(), info)
         info['rollout_iters_per_update'] = num_rollout_iters
         info['global_step'] = i
+        info['time_per_rollout'] = rollout_total_time / (num_rollout_iters * rollout_batch_size * jax.host_count())
+        info['time_per_effective_rollout'] = rollout_total_time / global_batch_size
+        info['effective_rollout_ratio'] = global_batch_size / (rollout_batch_size * jax.host_count() * num_rollout_iters)
         info['minibatches_per_global_step'] = global_batch_size // FLAGS.ppo_minibatch
         # info.update(jax.tree.map(lambda x: np.mean(x), env_infos_history))
         for k, v in env_infos_history.items():
-            info[k] = np.mean(v)
+            info['env/'+k] = np.mean(v)
         if jax.process_index() == 0:
             # rollouts_table.add_data(i, env.render(new_states[0]), returns_local[0])
             rollouts_list.append([i, env.render(new_states[0]), returns_local[0]])
