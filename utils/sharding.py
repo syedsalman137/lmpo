@@ -65,3 +65,7 @@ def create_sharding(shard_type, train_state_shape=None):
     # The first three are 'Sharding' objects which are pytrees.
     # The last two are helper functions for moving data between devices.
     return train_state_sharding, no_shard, data_sharding, shard_data
+
+def host_gather(x):
+    is_multi_host = len(jax.local_devices()) != len(jax.devices())
+    return jax.experimental.multihost_utils.process_allgather(x) if is_multi_host else x

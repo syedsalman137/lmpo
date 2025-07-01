@@ -2,9 +2,6 @@
 import jax.numpy as jnp
 import jax
 import numpy as np
-from utils.sharding import create_sharding
-from utils.train_state import TrainState
-from models.tokenizer import create_tokenizer
 import tqdm
 import optax
 from functools import partial
@@ -14,30 +11,33 @@ import sys
 import time
 from absl import app, flags
 
-from jax.experimental.compilation_cache import compilation_cache as cc
-cc.initialize_cache('/nfs/jax-cache')
+try: # If you like to use these helpers, you can.
+    from jax.experimental.compilation_cache import compilation_cache as cc
+    cc.initialize_cache('/nfs/jax-cache')
+    from localutils.debugger import enable_debug
+    enable_debug()
+except:
+    pass
 
-from localutils.debugger import enable_debug
-enable_debug()
-
-from lmpo.models.qwen3 import create_model_from_hf, create_model_from_ckpt
+from lmpo.models.qwen3 import create_model_from_ckpt
 from lmpo.inference.sampling import pad_and_collate, autoregressive_sample
 from lmpo.utils.configs import define_flag_dict
 from lmpo.utils.wandb import setup_wandb
-from lmpo.envs.poem_length import PoemLengthEnv
-from lmpo.envs.gsm8k import GSM8KEnv
-from lmpo.envs.countdown import CountdownEnv
+from lmpo.envs.env_creator import create_env
+from lmpo.utils.sharding import create_sharding, host_gather
+from lmpo.utils.train_state import TrainState
+from lmpo.models.tokenizer import create_tokenizer
 
 config = ml_collections.ConfigDict({
     'wandb_project': "lmpo",
     'wandb_name': 'lmpo-run',
     'model_dir': '/nfs/gcs/jaxconverted/Qwen3-1.7B/',
     # env settings.
-    'env_name': 'poem',
-    'num_generation_tokens': -1, # Use default from env.
-    'inference_batch_per_device': 4,
+    'env_name': 'poem', # (poem, gsm8k, countdown)
+    'num_generation_tokens': -1, # -1 = use default from env.
+    'inference_batch_per_device': 4, # Set this to the maximum until OOM.
     # training settings.
-    'groups_per_batch': 64, # for global batch, multiply by group_size.
+    'groups_per_batch': 64, # global batch = groups_per_batch * group_size
     'ppo_minibatch': 64,
     'group_size': 8, # GRPO group size.
     'do_group_normalization': 1,
@@ -57,8 +57,6 @@ if jax.process_index() == 0:
 
 is_multi_host = len(jax.local_devices()) != len(jax.devices())
 host_id = jax.process_index()
-def host_gather(x):
-    return jax.experimental.multihost_utils.process_allgather(x) if is_multi_host else x
                                           
 ckpt_dir = FLAGS.model_dir
 model, params = create_model_from_ckpt(ckpt_dir)
@@ -76,12 +74,7 @@ jax.debug.visualize_array_sharding(train_state.params['Block_0']['Dense_0']['ker
 tokenizer = create_tokenizer(ckpt_dir)
 pad_id = tokenizer.get_pad_token_id()
 
-if FLAGS.env_name.lower() == 'poem':
-    env = PoemLengthEnv(tokenizer)
-elif FLAGS.env_name.lower() == 'gsm8k':
-    env = GSM8KEnv(tokenizer)
-elif FLAGS.env_name.lower() == 'countdown':
-    env = CountdownEnv(tokenizer)
+env = create_env(FLAGS.env_name, tokenizer)
 if FLAGS.num_generation_tokens == -1:
     FLAGS.num_generation_tokens = env.tokens_per_action
 np.random.seed(jax.process_index())
@@ -121,12 +114,12 @@ def update(train_state: TrainState, token_batch, mask, advantages, old_logprobs)
         importance_ratio = avg_over_mask(ratio)
         importance_ratio_mag = avg_over_mask(jnp.abs(1 - ratio))
         approx_kl = avg_over_mask((ratio - 1) - logratio)
-        entropy_avg = avg_over_mask(entropy, axis=-1)
+        entropy_avg = avg_over_mask(entropy)
         clip_fracs = avg_over_mask(jnp.abs(ratio - 1.0) > FLAGS.clip_epsilon)
         cross_entropy = avg_over_mask(-token_logprobs)
 
         loss_pg = jnp.mean(pg_loss * mask)
-        loss_ent = jnp.mean(entropy_avg * mask) * FLAGS.entropy_coef
+        loss_ent = -jnp.mean(entropy_avg * mask) * FLAGS.entropy_coef
         loss = loss_pg + loss_ent
         return loss, {
             'loss': loss,
