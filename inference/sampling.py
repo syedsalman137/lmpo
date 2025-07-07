@@ -58,7 +58,7 @@ def autoregressive_sample(model: Qwen3Model, params, prompt_tokens, num_generati
 
         # Yes, this is very ugly, even a sin. 
         # It's a helper flag to force insertion of an <answer> tag (force_answer_at) tokens before the end.
-        if force_answer_at != -1:
+        if force_answer_at > 0:
             if i == max_samples - force_answer_at:
                 sampled_token = jnp.ones_like(sampled_token) * 198 # \n
             elif i == max_samples - force_answer_at+1:

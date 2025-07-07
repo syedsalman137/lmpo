@@ -54,8 +54,8 @@ def evaluate_equation(equation_str) -> int | None:
     except Exception as e:
         return None
     
-def generate_candidate_expression(num_terms):
-    numbers = [np.random.randint(100) for _ in range(num_terms)]
+def generate_candidate_expression(num_terms, rng):
+    numbers = [rng.randint(100) for _ in range(num_terms)]
     syms = symbols(f"x:{num_terms}")
     expr = syms[0]
 
@@ -92,13 +92,13 @@ def generate_candidate_expression(num_terms):
 
     return expr, numbers, syms
 
-def generate_expression():
+def generate_expression(rng):
     num_terms = 4
 
     max_attempts = 100
     for attempt in range(max_attempts):
         try:
-            expr, numbers, syms = generate_candidate_expression(num_terms)
+            expr, numbers, syms = generate_candidate_expression(num_terms, rng)
 
             # Substitute actual numbers to get target
             subs = {sym: num for sym, num in zip(syms, numbers)}
@@ -122,12 +122,14 @@ class CountdownEnv(BaseEnv):
     def __init__(self, tokenizer):
         super().__init__() 
         self.tokens_per_action = 512
+        self.force_answer_at = 50
         self.data_dict = {}
         self.tokenizer = tokenizer
 
-    def reset(self):
-        _, numbers, target = generate_expression()
-        np.random.shuffle(numbers)
+    def reset(self, idx):
+        rng = np.random.RandomState(idx)
+        _, numbers, target = generate_expression(rng)
+        rng.shuffle(numbers)
         output_tokens = self.tokenizer.apply_chat_template([
                 {'role': 'system', 'content': SYSTEM_PROMPT},
                 {"role": "user", "content": USER_PROMPT.format(target=target, numbers=numbers)},

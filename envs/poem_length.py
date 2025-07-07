@@ -9,15 +9,12 @@ class PoemState(BaseState):
 class PoemLengthEnv(BaseEnv):
     def __init__(self, tokenizer):
         super().__init__()
-        # self.tokens_per_action = 128
-        self.tokens_per_action = 32
+        self.tokens_per_action = 128
         self.tokenizer = tokenizer
 
-    def reset(self):
+    def reset(self, idx):
         imagenet_labels = open('inference/imagenet_labels.txt').read().splitlines()
-        rand_idx = np.random.randint(0, len(imagenet_labels))
-        # msg = f'Write three sentences about {imagenet_labels[rand_idx]}'
-        msg = f'Write a poem about cats.'
+        msg = f'Write three sentences about {imagenet_labels[idx % 1000]}'
         output_tokens = self.tokenizer.apply_chat_template(
             [{"role": "user", "content": msg}],
             add_generation_prompt=True,

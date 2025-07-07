@@ -8,11 +8,13 @@ class BaseState:
 class BaseEnv():
     """Basic class for an LLM RL environment."""
     tokens_per_action = 32
+    force_answer_at = -1
+    num_tasks = -1  # -1 means no limit, otherwise it is the number of tasks in the dataset.
 
     def __init__(self):
         pass
 
-    def make_state(self): # return a state, and an initial output_tokens.
+    def reset(self, idx): # return a state, and an initial output_tokens.
         raise NotImplementedError
 
     def step(self, state, action_tokens):

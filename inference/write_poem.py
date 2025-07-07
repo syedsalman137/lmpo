@@ -7,14 +7,6 @@ from lmpo.inference.sampling import pad_and_collate, autoregressive_sample
 from lmpo.utils.sharding import create_sharding, host_gather
 from lmpo.models.tokenizer import create_tokenizer
 
-try: # If you like to use these helpers, you can.
-    from jax.experimental.compilation_cache import compilation_cache as cc
-    cc.initialize_cache('/nfs/jax-cache')
-    from localutils.debugger import enable_debug
-    enable_debug()
-except:
-    pass
-
 parser = argparse.ArgumentParser()
 parser.add_argument('--ckpt_dir', type=str, default='/nfs/gcs/jaxconverted/Qwen3-0.6B/')
 args = parser.parse_args()
