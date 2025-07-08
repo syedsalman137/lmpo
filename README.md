@@ -1,6 +1,6 @@
-# nano-lmpo: A minimal repo for Language Model Policy Optimization
+# lmpo: A minimal repo for Language Model Policy Optimization
 
-This repo is a standalone implementation of using reinforcement learning to post-train language models. The focus is on ease-of-understanding for research. Please fork and/or play with the code! The `nano-lmpo` repository is built using JAX, and has no major external dependencies.
+This repo is a standalone implementation of using reinforcement learning to post-train language models. The focus is on ease-of-understanding for research. Please fork and/or play with the code! The `lmpo` repository is built using JAX, and has no major external dependencies.
 
 (We do depend on the huggingface tokenizer, because I can't figure out how it works to replicate it. If anyone knows, please let me know...)
 
@@ -47,7 +47,7 @@ python core/grpo.py --wandb_name Poem --env_name Poem --model_dir ~/checkpoints/
 
 ## Results
 
-`Countdown` is an environment where the agent needs to manipulate four numbers to form a desired result, using only mathematical primitives. This was used in the (TinyZero)[https://github.com/Jiayi-Pan/TinyZero] project.
+`Countdown` is an environment where the agent needs to manipulate four numbers to form a desired result, using only mathematical primitives. This was used in the [TinyZero](https://github.com/Jiayi-Pan/TinyZero) project.
 ```
 ######################### User Message
 Using the numbers [52, 23, 1, 35], create an equation that equals 64. You can use basic arithmetic operations (+, -, *, /) and each number can only be used once. Show your work in <think> </think> tags. Think for only ten sentences, then return the final answer in <answer> </answer> tags, for example <answer> (1 + 2) / 3 </answer>.
