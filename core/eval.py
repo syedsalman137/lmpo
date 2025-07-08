@@ -7,19 +7,25 @@ import sys
 from absl import app, flags
 
 from lmpo.models.qwen3 import create_model_from_ckpt
-from lmpo.inference.sampling import pad_and_collate, autoregressive_sample
 from lmpo.utils.configs import define_flag_dict
 from lmpo.envs.env_creator import create_env
 from lmpo.utils.sharding import create_sharding, host_gather
 from lmpo.models.tokenizer import create_tokenizer
+from lmpo.core.sampling import pad_and_collate, autoregressive_sample
 
 def eval_model(model, params, env, 
                num_generation_tokens,
                force_answer_at,
                prompt_length,
                inference_batch_per_device,
-               num_epochs):
+               pad_id,
+               shard_data_fn,
+               no_shard,
+               data_shard,
+               num_epochs
+               ):
     np.random.seed(jax.process_index())
+    host_id = jax.process_index()
     env_num_tasks = env.num_tasks if env.num_tasks != -1 else 100
     total_num_tasks = num_epochs * env_num_tasks
     env_task_idx = 0
@@ -34,6 +40,7 @@ def eval_model(model, params, env,
         for _ in range(rollout_batch_size):
             env_state, output_tokens = env.reset(min(env_task_idx + jax.process_index(), env_num_tasks-1))
             env_task_idx += jax.process_count()
+            env_task_idx = env_task_idx % env_num_tasks
             env_states.append(env_state)
             env_tokens.append(output_tokens)
 
@@ -61,6 +68,12 @@ def eval_model(model, params, env,
     env_infos_history = {k: np.array(v)[:total_num_tasks] for k, v in env_infos_history.items()}
     return new_states, env_infos_history
 
+
+
+
+######$###########################################
+### Runnable function to eval a checkpoint on an env.
+##################################################
 if __name__ == '__main__':
     config = ml_collections.ConfigDict({
         'model_dir': '/nfs/gcs/jaxconverted/Qwen3-1.7B/',
@@ -76,8 +89,6 @@ if __name__ == '__main__':
     define_flag_dict(config)
     FLAGS = flags.FLAGS
     FLAGS(sys.argv)
-
-    host_id = jax.process_index()
                                             
     ckpt_dir = FLAGS.model_dir
     model, params = create_model_from_ckpt(ckpt_dir)
@@ -101,6 +112,10 @@ if __name__ == '__main__':
         force_answer_at=FLAGS.force_answer_at,
         prompt_length=FLAGS.prompt_length,
         inference_batch_per_device=FLAGS.inference_batch_per_device,
+        pad_id=pad_id,
+        shard_data_fn=shard_data_fn,
+        no_shard=no_shard,
+        data_shard=data_shard,
         num_epochs=FLAGS.num_epochs,
     )
     print(" ======================= Example Rollout ======================= ")

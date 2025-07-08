@@ -1,28 +1,23 @@
-'''From https://gist.github.com/willccbb/4676755236bb08cab5f4e54a0475d6fb'''
+'''From https://github.com/agentica-project/rllm and https://github.com/agentica-project/rllm/blob/main/rllm/rewards/math_utils/utils.py'''
 
 from envs.base import BaseEnv, BaseState
 from dataclasses import dataclass, replace
-import numpy as np
+from envs.deepscaler_utils import grade_answer
 
 def extract_xml_answer(text: str) -> float:
     try:
         answer = text.split("<answer>")[-1]
         answer = answer.split("</answer>")[0]
         answer = answer.strip().replace(",", "").replace("$", "")
-        return float(answer)
+        return answer
     except:
-        return -100
+        return ''
 
 def has_formatting(text: str) -> bool:
     return "<answer>" in text and "</answer>" in text
 
-def extract_hash_answer(text: str) -> str | None:
-    if "####" not in text:
-        raise ValueError("Expected text to contain '####' for answer extraction.")
-    return float(text.split("####")[1].strip().replace(",", "").replace("$", ""))
-
 SYSTEM_PROMPT = """
-Respond in the following format. Put a single number in the <answer> tag.
+Respond in the following format. Put the final answer within the <answer> tag, use latex \\frac{a}{b} for fractions.
 <think>
 ...
 </think>
@@ -31,31 +26,31 @@ Respond in the following format. Put a single number in the <answer> tag.
 </answer>"""
 
 @dataclass(frozen=True)
-class GSMState(BaseState):
+class AimeState(BaseState):
     tokens: list
-    correct_answer: float
+    correct_answer: str
     rendered: str = ""
     
-class GSM8KEnv(BaseEnv):
-    def __init__(self, tokenizer, train=True):
+class AimeEnv(BaseEnv):
+    def __init__(self, tokenizer):
         super().__init__()
         self.tokens_per_action = 512
         self.force_answer_at = 50
         self.data_dict = {}
         self.tokenizer = tokenizer
         from datasets import load_dataset
-        self.ds = load_dataset('openai/gsm8k', 'main')['train' if train else 'test']
+        self.ds = load_dataset("HuggingFaceH4/aime_2024", split="train")
         self.num_tasks = len(self.ds)
 
     def reset(self, idx):
         output_tokens = self.tokenizer.apply_chat_template([
                 {'role': 'system', 'content': SYSTEM_PROMPT},
-                {"role": "user", "content": self.ds[idx]['question']},
+                {"role": "user", "content": self.ds[idx]['problem']},
             ],
             add_generation_prompt=True,
             enable_thinking=True
         )
-        state = GSMState(tokens=output_tokens, correct_answer=extract_hash_answer(self.ds[idx]['answer']))
+        state = AimeState(tokens=output_tokens, correct_answer=self.ds[idx]['answer'])
         return state, output_tokens
 
     def render(self, state):
@@ -69,7 +64,7 @@ class GSM8KEnv(BaseEnv):
         if has_formatting(action_msg):
             reward = 0.1
             evaluated_answer = extract_xml_answer(action_msg)
-            if abs(evaluated_answer - state.correct_answer) < 1e-6:
+            if grade_answer(evaluated_answer, state.correct_answer):
                 reward = 1.0
 
         render_str = [

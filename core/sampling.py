@@ -23,6 +23,7 @@ def autoregressive_sample(model: Qwen3Model, params, prompt_tokens, num_generati
     Samples tokens autoregressively, and can batch for performance.
     Args:
         prompt_tokens: An array of tokens, padded by `pad_id` on the LEFT. [batch, time].
+        force_answer_at: If > 0, forces the insertion of an <answer> tag at (force_answer_at) tokens before the end of the generation.
     """
     global model_apply
     batch_size = prompt_tokens.shape[0]
@@ -74,3 +75,55 @@ def autoregressive_sample(model: Qwen3Model, params, prompt_tokens, num_generati
 
     tokens = jnp.stack(tokens_list, axis=-1) # [batch, time]
     return tokens
+
+
+
+
+######$###########################################
+### Example of sampling an LLM to generate a poem.
+##################################################
+if __name__ == "__main__":
+    import argparse
+    from lmpo.models.qwen3 import create_model_from_ckpt
+    from lmpo.utils.sharding import create_sharding, host_gather
+    from lmpo.models.tokenizer import create_tokenizer
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--ckpt_dir', type=str, default='/nfs/gcs/jaxconverted/Qwen3-0.6B/')
+    args = parser.parse_args()
+    ckpt_dir = args.ckpt_dir
+
+    model, params = create_model_from_ckpt(ckpt_dir)
+    param_shard, no_shard, data_shard, shard_data_fn = create_sharding('fsdp', train_state_shape=params)
+    params = jax.jit(lambda x: x, out_shardings=param_shard)(params)
+    tokenizer = create_tokenizer(ckpt_dir)
+
+    labels = ['cat', 'dog', 'bird', 'fish', 'elephant', 'tiger', 'lion', 'giraffe', 'zebra', 'monkey']
+    poem_prompts = [f'Write a haiku about of {labels[np.random.randint(len(labels))]}' for _ in range(len(jax.local_devices()))]
+
+    pad_id = 0
+    token_list = [
+        tokenizer.apply_chat_template([{"role": "user", "content": text}], add_generation_prompt=True, enable_thinking=False)
+        for text in poem_prompts
+    ]
+
+    token_batch = pad_and_collate(token_list, pad_id=pad_id, force_length=256)
+    print("Input tokens local:", token_batch.shape)
+    token_batch = shard_data_fn(token_batch)
+    print("Input tokens global:", token_batch.shape)
+    num_generation_tokens = 32
+    rng = jax.random.PRNGKey(0)
+    tokens_out = autoregressive_sample(
+        model, params, token_batch, rng=rng, num_generation_tokens=num_generation_tokens, pad_id=pad_id, data_shard=data_shard, no_shard=no_shard)
+    tokens_out = host_gather(tokens_out)
+
+    responses = [tokenizer.decode(row) for row in tokens_out]
+    if jax.process_index() == 0:
+        for i, text in enumerate(poem_prompts):
+            print(f" ======= {text} =======")
+            print(responses[i].split('<|im_end|>')[0])
+
+        print("========= Full raw decoded tokens =========")
+        print(tokenizer.decode(token_list[0] + tokens_out[0].tolist()))
+        print('Total tokens shape', tokens_out.shape)
+        print("=============")

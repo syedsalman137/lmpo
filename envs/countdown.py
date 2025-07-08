@@ -156,15 +156,11 @@ class CountdownEnv(BaseEnv):
                 if abs(evaluated_answer - state.correct_answer) < 1e-6:
                     reward = 1.0
 
-        # length_penalty = -0.1 * np.clip((len(action_tokens) - 0.75 * self.tokens_per_action) / (self.tokens_per_action*0.25), 0, 1)
-        # reward += length_penalty
-
         render_str = [
             f"{self.tokenizer.decode(state.tokens + action_tokens)}",
             f"Evaluated answer: {evaluated_answer}",
             f"Correct answer: {state.correct_answer}",
             f"Valid equation? {valid_equation(state, action_msg)}",
-            # f"Length penalty: {length_penalty:.2f}",
             f"Reward: {reward:.2f}",
         ]
         render_str = "\n".join(render_str)
@@ -172,6 +168,5 @@ class CountdownEnv(BaseEnv):
         return state, [], reward, True, {
             'valid_equation': reward > 0.0,
             'correct_answer': reward >= 1.0,
-            # 'length_penalty': length_penalty,
             'action_length': len(action_tokens),
         }

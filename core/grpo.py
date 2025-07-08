@@ -20,7 +20,6 @@ except:
     pass
 
 from lmpo.models.qwen3 import create_model_from_ckpt
-from lmpo.inference.sampling import pad_and_collate, autoregressive_sample
 from lmpo.utils.configs import define_flag_dict
 from lmpo.utils.wandb import setup_wandb
 from lmpo.envs.env_creator import create_env
@@ -28,19 +27,22 @@ from lmpo.utils.sharding import create_sharding, host_gather
 from lmpo.utils.train_state import TrainState
 from lmpo.models.tokenizer import create_tokenizer
 from lmpo.utils.checkpoint import Checkpoint
+from lmpo.core.sampling import pad_and_collate, autoregressive_sample
+from lmpo.core.eval import eval_model
 
 config = ml_collections.ConfigDict({
     'wandb_project': "lmpo",
     'wandb_name': 'lmpo-run',
     'model_dir': '/nfs/gcs/jaxconverted/Qwen3-1.7B/',
     'save_dir': "",
-    'save_interval': 50,
+    'save_interval': 20,
     # env settings.
     'env_name': 'poem', # (poem, gsm8k, countdown)
-    'test_env_name': '',
     'num_generation_tokens': -1, # -1 = use default from env.
     'prompt_length': 256,
     'force_answer_at': -1, # -1 = use default from env.
+    'test_env_name': '',
+    'test_interval': 10,
     # sampling settings.
     'inference_batch_per_device': 4, # Set this to the maximum until OOM. Should not affect results.
     # training settings.
@@ -87,7 +89,7 @@ if FLAGS.num_generation_tokens == -1:
 if FLAGS.force_answer_at == -1:
     FLAGS.force_answer_at = env.force_answer_at
 np.random.seed(jax.process_index())
-env_num_tasks = env.num_tasks if env.num_tasks != -1 else 100
+env_num_tasks = env.num_tasks if env.num_tasks != -1 else 1000000
 env_task_idx = 0
 
 @jax.jit
@@ -185,6 +187,7 @@ for i in tqdm.tqdm(range(10000)):
         for _ in range(rollout_batch_size // FLAGS.group_size):
             env_state, output_tokens = env.reset(min(env_task_idx + jax.process_index(), env_num_tasks-1))
             env_task_idx += jax.process_count()
+            env_task_idx = env_task_idx % env_num_tasks
             for _ in range(FLAGS.group_size):
                 env_states.append(env_state)
                 env_tokens.append(output_tokens)
@@ -303,6 +306,25 @@ for i in tqdm.tqdm(range(10000)):
                     if k not in ['rollouts_table']:
                         print(f"{k}: {v}")
             wandb.log(info)
+
+    if i % FLAGS.test_interval == 0 and env_test is not None:
+        _, test_env_history = eval_model(
+            model=train_state.model_def,
+            params=train_state.params,
+            env=env_test,
+            num_generation_tokens=FLAGS.num_generation_tokens,
+            force_answer_at=FLAGS.force_answer_at,
+            prompt_length=FLAGS.prompt_length,
+            inference_batch_per_device=FLAGS.inference_batch_per_device,
+            pad_id=pad_id,
+            shard_data_fn=shard_data_fn,
+            no_shard=no_shard,
+            data_shard=data_shard,
+            num_epochs=1,
+        )
+        test_info = {f'test_env/{k}': np.mean(v) for k, v in test_env_history.items()}
+        if jax.process_index() == 0:
+            wandb.log(test_info, commit=False)
 
     # This only saves the params. If you want to save the optimizer, gather the whole train_state.
     if i % FLAGS.save_interval == 0 and FLAGS.save_dir != "":
