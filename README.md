@@ -5,14 +5,14 @@ This repo is a standalone implementation of using reinforcement learning to post
 (We do depend on the huggingface tokenizer, because I can't figure out how it works to replicate it. If anyone knows, please let me know...)
 
 ## Repo Structure
-- `grpo.py` -- This is where you should start looking. It contains the main code for training a model via GRPO/PPO.
+- `grpo.py` -- Start here. It contains the main code for training a model via GRPO/PPO.
 - `sampling.py` -- This file contains an implementation of batched autoregressive sampling using a KV cache.
 - `eval.py` -- Helpers function for evaluating a model checkpoint on a given environment.
-- `envs/` -- In this folder, we've implemented a few classic LLM RL environments, including reward-evaluation logic.
+- `envs/` -- In this folder, we've implemented a few classic LLM RL environments, including evaluation logic.
 - `models/` -- Utils for defining model architecture. Currently supports Qwen3 of various sizes.
 - `utils/` -- General utilities like sharding, checkpointing, logging.
 
-This repo is intentionally built to be easy to modify. If you read `grpo.py`, all the main logic is there. No crazy abstractions.
+This repo is intentionally built to be easy to modify. If you read `grpo.py`, all the main logic is there. No crazy abstractions. Some more details:
 - The code currently supports Qwen3 models, and was tested with Qwen3-0.6B, Qwen3-1.7B, and Qwen3-8B.
 - This repo was written to support multi-host TPU training, but it also works on a single host and on GPUs. By default, the model is sharded via FSDP.
 - All model calls are JIT compiled.
@@ -22,12 +22,13 @@ This repo is intentionally built to be easy to modify. If you read `grpo.py`, al
 
 ## Setup
 First, you will want to install the dependencies:
-```
+```bash
 pip install numpy absl-py ml-collections wandb einops jaxtyping opt-einsum transformers tqdm jax==0.6.1 jaxlib==0.6.1 optax==0.2.5 flax==0.10.6 chex==0.1.89
+# You may need to install "jax[cuda12]" or "jax[tpu]" depending on your system.
 ```
 
 Then, download the Qwen checkpoints and convert into a Jax checkpoint.
-```
+```bash
 python models/download_model.py --model_id Qwen/Qwen3-1.7B --dest_root_path ~/checkpoints/
 python models/hf_to_jax.py
 
@@ -36,12 +37,12 @@ TPU_CHIPS_PER_PROCESS_BOUNDS=2,2,1 TPU_PROCESS_BOUNDS=1,1,1 TPU_VISIBLE_DEVICES=
 ```
 
 To test if everything worked, you can try running the sampling code.
-```
+```bash
 python core/sampling.py --ckpt_dir ~/checkpoints/Qwen3-1.7B/
 ```
 
 To train GRPO, try the following command to train against PoemLength. This is a very easy environment, where reward is proportional to number of output characters. You should see `return` reach 1900 within 200 steps, in about 10 minutes.
-```
+```bash
 python core/grpo.py --wandb_name Poem --env_name Poem --model_dir ~/checkpoints/Qwen3-1.7B/ --groups_per_batch 32
 ```
 
@@ -59,13 +60,13 @@ First, maybe I can try adding some numbers. 52 + 23 is 75. Then 75 minus somethi
 <answer> (52 / 1) + 35 - 23 </answer>
 ```
 We can train an agent against synthetic Countdown tasks. Use the following command:
-```
+```bash
 python core/grpo.py --env_name countdown --model_dir ~/checkpoints/Qwen3-1.7B/
 ```
 ![countdown graph](imgs/countdown.png)
 
 The training run will automatically plot results to wandb. We can also evaluate the saved checkpoints on a deterministic test set:
-```
+```bash
 python core/eval.py --env_name Countdown --model_dir ~/checkpoints/countdown/step60
 ```
 | Step          | Score         |
@@ -94,13 +95,13 @@ Therefore, the distance from the starting tee to the hole is:
 </answer>
 ```
 To train an agent on GSM8K:
-```
+```bash
 python core/grpo.py --env_name gsm8k --model_dir ~/checkpoints/Qwen3-1.7B/ --test_env_name gsm8k-test
 ```
 ![gsm8k graph](imgs/gsm8k.png)
 
 **TODO**. We have [Deepscaler](https://pretty-radio-b75.notion.site/DeepScaleR-Surpassing-O1-Preview-with-a-1-5B-Model-by-Scaling-RL-19681902c1468005bed8ca303013a4e2) environments implemented, but this agent is still training.
-```
+```bash
 python core/grpo.py --env_name deepscaler --save_dir /nfs/gcs/checkpoints/lmpo/deepscaler --test_env_name aime --num_generation_tokens 1024 --inference_batch_per_device 2 --prompt_length 512
 ```
 
