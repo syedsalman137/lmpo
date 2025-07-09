@@ -1,6 +1,6 @@
 # lmpo: A minimal repo for Language Model Policy Optimization
 
-This repo is a standalone implementation of using reinforcement learning to post-train language models. The focus is on ease-of-understanding for research. Please fork and/or play with the code! The `lmpo` repository is built using JAX, and has no major external dependencies.
+This repo is a standalone implementation of using reinforcement learning to post-train language models. The focus is on ease-of-understanding for research. Please fork and/or play with the code! The `lmpo` repository is built using JAX, and has no major external dependencies. The core logic is around 400 lines of code, split into three files.
 
 (We do depend on the huggingface tokenizer, because I can't figure out how it works to replicate it. If anyone knows, please let me know...)
 
@@ -129,6 +129,8 @@ Reinforcement learning for LLMs is not too different from classical deep reinfor
     - Rather than naively maximizing $\log (\pi_\theta(a|s) / \hat{\pi}(a|s)) * A$, we maximize a *clipped* version -- $clip(\log (\pi_\theta(a|s) / \hat{\pi}(a|s)) * A, -0.2, 0.2)$.
     - Intuitively, we are saying that regardless of how high the advantage is, we only want our policy to change by $\pm 0.2$ relative log-probabililty.
     - In practice, PPO uses an asymmetric clipping -- only positive advantages are clipped, but negative advantages are left untouched. This creates a 'conservative' update that fullly avoids negative advantaged actions.
+
+
 ## References
 
 This repo uses machinery collected from a few places:
