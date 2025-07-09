@@ -20,6 +20,7 @@ This repo is intentionally built to be easy to modify. If you read `grpo.py`, al
 - All model calls are JIT compiled.
 - Our sampling code is compiled, but may not be as efficient as e.g. vllm.
 - Only bandit (e.g. single-action) environments are supported at the moment. We've implemented some synthetic tasks like `countdown`, and also classic benchmarks like `GSM8K`.
+- There is some very sinful logic in `sampling.py` that handles the force insertion of `<answer>` tokens near the end of an action. Eventually, this will be cleaned up...
 
 
 ## Setup
