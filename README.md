@@ -1,6 +1,6 @@
 # lmpo: A minimal repo for Language Model Policy Optimization
 
-This repo is a standalone implementation of using reinforcement learning to post-train language models. The focus is on ease-of-understanding for research. Please fork and/or play with the code! The `lmpo` repository is built using JAX, and has no major external dependencies. The core logic is around 400 lines of code, split into three files.
+This repo is a standalone implementation of using reinforcement learning to post-train language models. The focus is on ease-of-understanding for research. Please fork and/or play with the code! The `lmpo` repository is built using JAX, and has no major external dependencies. The core logic is around 400 lines of code, split into three files. This repo is in-progress, but decently clean.
 
 (We do depend on the huggingface tokenizer, because I can't figure out how it works to replicate it. If anyone knows, please let me know...)
 
@@ -102,10 +102,11 @@ python core/grpo.py --env_name gsm8k --model_dir ~/checkpoints/Qwen3-1.7B/ --tes
 ```
 ![gsm8k graph](imgs/gsm8k.png)
 
-**TODO**. We have [Deepscaler](https://pretty-radio-b75.notion.site/DeepScaleR-Surpassing-O1-Preview-with-a-1-5B-Model-by-Scaling-RL-19681902c1468005bed8ca303013a4e2) environments implemented, but this agent is still training.
+**TODO**. We have [Deepscaler](https://pretty-radio-b75.notion.site/DeepScaleR-Surpassing-O1-Preview-with-a-1-5B-Model-by-Scaling-RL-19681902c1468005bed8ca303013a4e2) environments implemented, but still need to tweak hyperparameters, etc. These tasks are tricky because they generally require 30K+ reasoning tokens to see the best performance, and that's a lot compute.
 ```bash
 python core/grpo.py --env_name deepscaler --save_dir /nfs/gcs/checkpoints/lmpo/deepscaler --test_env_name aime --num_generation_tokens 1024 --inference_batch_per_device 2 --prompt_length 512
 ```
+![gsm8k graph](imgs/deepscaler.jpg)
 
 ## Overview of RL for LLMs
 
