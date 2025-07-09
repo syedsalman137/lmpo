@@ -4,6 +4,8 @@ This repo is a standalone implementation of using reinforcement learning to post
 
 (We do depend on the huggingface tokenizer, because I can't figure out how it works to replicate it. If anyone knows, please let me know...)
 
+![lmpo](imgs/lmpo.png)
+
 ## Repo Structure
 - `grpo.py` -- Start here. It contains the main code for training a model via GRPO/PPO.
 - `sampling.py` -- This file contains an implementation of batched autoregressive sampling using a KV cache.
@@ -29,8 +31,8 @@ pip install numpy absl-py ml-collections wandb einops jaxtyping opt-einsum trans
 
 Then, download the Qwen checkpoints and convert into a Jax checkpoint.
 ```bash
-python models/download_model.py --model_id Qwen/Qwen3-1.7B --dest_root_path ~/checkpoints/
-python models/hf_to_jax.py
+python models/download_model.py --model_id Qwen/Qwen3-1.7B --dest_root_path ~/checkpoints/hf/
+python models/hf_to_jax.py --hf_dir ~/checkpoints/hf/Qwen3-1.7B/ --ckpt_dir ~/checkpoints/Qwen3-1.7B/
 
 # On a multi-host machine, use:
 TPU_CHIPS_PER_PROCESS_BOUNDS=2,2,1 TPU_PROCESS_BOUNDS=1,1,1 TPU_VISIBLE_DEVICES=0,1,2,3 python models/hf_to_jax.py
@@ -106,3 +108,31 @@ python core/grpo.py --env_name deepscaler --save_dir /nfs/gcs/checkpoints/lmpo/d
 ```
 
 ## Overview of RL for LLMs
+
+Reinforcement learning for LLMs is not too different from classical deep reinforcement learning. The overall loop is exactly the same (if you squint, the top figure above is just the usual RL loop). When building an RL system, we generally focus on two components -- **rollout generation**, and **policy improvement**.
+
+**Rollout generation** involves sampling from our current policy and interacting with the environment. Most LLM environments are "bandit" settings, meaning that the agent only takes a single action, and recieves a reward accordingly. Some LLM-RL environments are [multi-turn](https://lmrl-gym.github.io/) but it's less common as of today. The bottleneck in LLM rollout generation is usually sampling from the policy itself, which requires autoregressive token generation. For policy gradient RL methods (e.g. PPO), we will generate a batch of rollouts at at the same time. Each rollout will be labelled with a scalar reward according to the environment's evaluation criteria.
+
+**Policy improvement**. Once we have our batch of rollouts, the next step is to update our policy.
+- Policy gradient methods follow the general form of $\theta \rightarrow E[\nabla_\theta \log \pi_\theta(a|s) * A(s,a)]$, where $A$ is advantage.
+- We don't know the true advantage of an action, but we can estimate it from reward samples. 
+    - Advantage is defined as the difference in expected reward from taking a specific action, vs. sampling an action from the policy: $A(s,a) = R(s,a) - E[R(s)]$.
+    - In general we don't know $R(s,a)$ or $R(s)$, so they need to be estimated.
+    - The standard estimator for $R(s,a)$ is Monte Carlo estimation, which just means taking lots of samples and averaging them. LLM RL methods basically all do this. For a deterministic bandit environment, a single Monte Carlo estimate will just tell you the true reward.
+    - The simplest *value* estimator for $R(s)$ is simply $R(s) = 0$. This is actually fine, and works decently well.
+    - In GRPO-style methods, we can estimate $R(s)$ using Monte Carlo estimation over a group of rollouts.
+    - In classical PPO methods, we can use a learned value function and parameterize $R(s)$ as the output of a neural network.
+- Policy gradient methods are meant to use on-policy rollouts. But we usually want to train on slightly stale rollouts as well.
+    - We can use *importance sampling* to account for this discrepancy. Instead of the policy gradient above, we can use: $\nabla_\theta \log (\pi_\theta(a|s) / \hat{\pi}(a|s))$ where $\hat{\pi}$ is the old policy used for rollout generation. In deep RL, the old policy is just an older set of parameters. In practice, we often store the "old logprobs" during rollout sampling, and divide them out accordingly.
+    - In LLM RL, we might use a different computational graph for sampling and training. This means that the model output may be slightly different due to numerical issues. For that reason, it is common to recompute the old-logprobs during the start of each training step. We do that in this repo.
+- We often want to constrain the policy update to not make drastic changes. PPO provides machinery to do this in a simple way.
+    - Rather than naively maximizing $\log (\pi_\theta(a|s) / \hat{\pi}(a|s)) * A$, we maximize a *clipped* version -- $clip(\log (\pi_\theta(a|s) / \hat{\pi}(a|s)) * A, -0.2, 0.2)$.
+    - Intuitively, we are saying that regardless of how high the advantage is, we only want our policy to change by $\pm 0.2$ relative log-probabililty.
+    - In practice, PPO uses an asymmetric clipping -- only positive advantages are clipped, but negative advantages are left untouched. This creates a 'conservative' update that fullly avoids negative advantaged actions.
+## References
+
+This repo uses machinery collected from a few places:
+- Utils from the jaxtransformer library: https://github.com/kvfrans/jaxtransformer
+- Qwen model derived from: https://github.com/jax-ml/jax-llm-examples/tree/main/qwen3
+- Countdown env from https://github.com/open-thought/reasoning-gym/blob/main/reasoning_gym/games/countdown.py
+- Deepscaler env: https://pretty-radio-b75.notion.site/DeepScaleR-Surpassing-O1-Preview-with-a-1-5B-Model-by-Scaling-RL-19681902c1468005bed8ca303013a4e2
