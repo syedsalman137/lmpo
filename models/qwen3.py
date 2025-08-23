@@ -2,10 +2,11 @@
 Model structure for Qwen3. Taken from https://github.com/jax-ml/jax-llm-examples/blob/main/qwen3/qwen3_jax/model.py.
 """
 
+import re
 import json
 import glob
+import functools
 from safetensors import safe_open
-import re
 
 import jax
 import jax.numpy as jnp
@@ -52,6 +53,107 @@ def generate_pos_embeddings(
         precision=jax.lax.Precision.HIGHEST,
     )
     return jnp.sin(sinusoid_inp), jnp.cos(sinusoid_inp)
+
+# @functools.partial(jax.jit, static_argnames=['causal', 'query_block_size', 'key_block_size'])
+def tiled_multihead_attention(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    attention_mask: jax.Array,
+    causal: bool = True,
+    query_block_size: int = 128,
+    key_block_size: int = 128
+) -> jax.Array:
+    batch_size, num_heads, num_tokens, head_size = q.shape
+    num_kv_heads = k.shape[1]
+
+    original_dtype = q.dtype
+    q = q.astype(jnp.float32)
+    k = k.astype(jnp.float32)
+    v = v.astype(jnp.float32)
+
+    if num_kv_heads < num_heads:
+        num_repeats = num_heads // num_kv_heads
+        k = jnp.repeat(k, repeats=num_repeats, axis=1)
+        v = jnp.repeat(v, repeats=num_repeats, axis=1)
+
+    scale = 1.0 / jnp.sqrt(head_size)
+
+    o = jnp.zeros_like(q, dtype=jnp.float32)
+    m = jnp.full((batch_size, num_heads, num_tokens), -jnp.inf, dtype=jnp.float32)
+    l = jnp.zeros((batch_size, num_heads, num_tokens), dtype=jnp.float32)
+
+    if causal:
+        tril_mask = jnp.tril(jnp.ones((query_block_size, key_block_size), dtype=bool))
+
+    num_query_blocks = -(-num_tokens // query_block_size)
+    num_key_blocks = -(-num_tokens // key_block_size)
+
+    def query_loop_body(i_block, state):
+        o, m, l = state
+        i_start = i_block * query_block_size
+
+        q_i = jax.lax.dynamic_slice_in_dim(q, i_start, query_block_size, axis=2)
+
+        o_i_acc = jnp.zeros_like(q_i)
+        m_i_acc = jnp.full((batch_size, num_heads, query_block_size), -jnp.inf, dtype=jnp.float32)
+        l_i_acc = jnp.zeros((batch_size, num_heads, query_block_size), dtype=jnp.float32)
+
+        upper_j = i_block + 1 if causal else num_key_blocks
+
+        def key_loop_body(j_block, inner_state):
+            o_i, m_i, l_i = inner_state
+            j_start = j_block * key_block_size
+
+            k_j = jax.lax.dynamic_slice_in_dim(k, j_start, key_block_size, axis=2)
+            v_j = jax.lax.dynamic_slice_in_dim(v, j_start, key_block_size, axis=2)
+
+            s_ij = (q_i @ k_j.swapaxes(-2, -1)) * scale
+
+            mask_j = jax.lax.dynamic_slice_in_dim(attention_mask, j_start, key_block_size, axis=1)
+            mask_j_broadcastable = mask_j[:, None, None, :]
+
+            s_ij = (q_i @ k_j.swapaxes(-2, -1)) * scale
+
+            s_ij = jnp.where(mask_j_broadcastable, s_ij, -jnp.inf)
+
+            if causal:
+                s_ij = jax.lax.cond(
+                    i_block == j_block,
+                    lambda s: jnp.where(tril_mask, s, -jnp.inf),
+                    lambda s: s,
+                    s_ij
+                )
+
+            m_ij = jnp.max(s_ij, axis=-1)
+            m_i_new = jnp.maximum(m_i, m_ij)
+
+            p_ij = jnp.exp(s_ij - m_i_new[..., None])
+
+            scale_factor = jnp.exp(m_i - m_i_new)
+
+            l_i_new = scale_factor * l_i + jnp.sum(p_ij, axis=-1)
+
+            o_i_rescaled = o_i * (scale_factor * l_i / l_i_new)[..., None]
+            v_contribution = (p_ij @ v_j) / l_i_new[..., None]
+
+            o_i_new = o_i_rescaled + v_contribution
+
+            return o_i_new, m_i_new, l_i_new
+
+        o_i_final, m_i_final, l_i_final = jax.lax.fori_loop(
+            0, upper_j, key_loop_body, (o_i_acc, m_i_acc, l_i_acc)
+        )
+
+        o = jax.lax.dynamic_update_slice_in_dim(o, o_i_final, i_start, axis=2)
+        m = jax.lax.dynamic_update_slice_in_dim(m, m_i_final, i_start, axis=2)
+        l = jax.lax.dynamic_update_slice_in_dim(l, l_i_final, i_start, axis=2)
+
+        return o, m, l
+
+    final_o, _, _ = jax.lax.fori_loop(0, num_query_blocks, query_loop_body, (o, m, l))
+
+    return final_o.astype(original_dtype)
 
 class KVCache(flax.struct.PyTreeNode):
     k: list[jax.Array]
@@ -119,28 +221,37 @@ class Block(nn.Module):
             q_offset = 0
 
         # Causal Attention Mask.
-        b, t, qh, d = q.shape # qh = 16
-        _, T, kh, _ = k.shape # kh = 8
-        mask = q_idx[:, :, None] & k_idx[:, None, :]
-        mask = mask[:, None, :, :] # [B, 1, t, T]
-        qk_size = (1, 1, t, T)
-        q_iota = jax.lax.broadcasted_iota(jnp.int32, qk_size, 2)
-        k_iota = jax.lax.broadcasted_iota(jnp.int32, qk_size, 3)
-        q_positions = q_iota + q_offset
-        causal_mask = q_positions >= k_iota
-        mask = jnp.logical_and(mask, causal_mask)
-        mask = jnp.transpose(mask, (0, 2, 3, 1)) # [B, t, T, 1]
+        # b, t, qh, d = q.shape # qh = 16
+        # _, T, kh, _ = k.shape # kh = 8
+        # mask = q_idx[:, :, None] & k_idx[:, None, :]
+        # mask = mask[:, None, :, :] # [B, 1, t, T]
+        # qk_size = (1, 1, t, T)
+        # q_iota = jax.lax.broadcasted_iota(jnp.int32, qk_size, 2)
+        # k_iota = jax.lax.broadcasted_iota(jnp.int32, qk_size, 3)
+        # q_positions = q_iota + q_offset
+        # causal_mask = q_positions >= k_iota
+        # mask = jnp.logical_and(mask, causal_mask)
+        # mask = jnp.transpose(mask, (0, 2, 3, 1)) # [B, t, T, 1]
 
         # Attention.
-        q = jnp.reshape(q, (b, t, kh, qh // kh, d))
-        qk = jnp.einsum("bthgd,bThd->btThg", q, k) * (d ** -0.5)
-        qk = jnp.reshape(qk, (b, t, T, qh)) 
-        qk = jnp.where(mask, qk, -1e30) # good
-        attn = jax.nn.softmax(qk.astype(jnp.float32), axis=2) # on T dimension.
-        attn = jnp.reshape(attn, (b, t, T, kh, qh // kh))
-        qkv = jnp.einsum("btThg,bThd->bthgd", attn, v).astype(x.dtype)
-        qkv = jnp.reshape(qkv, (b, t, qh*d))
-        attn_x = nn.Dense(self.hidden_size, use_bias=False, dtype=jnp.bfloat16)(qkv)
+        # q = jnp.reshape(q, (b, t, kh, qh // kh, d))
+        # qk = jnp.einsum("bthgd,bThd->btThg", q, k) * (d ** -0.5)
+        # qk = jnp.reshape(qk, (b, t, T, qh)) 
+        # qk = jnp.where(mask, qk, -1e30) # good
+        # attn = jax.nn.softmax(qk.astype(jnp.float32), axis=2) # on T dimension.
+        # attn = jnp.reshape(attn, (b, t, T, kh, qh // kh))
+        # qkv = jnp.einsum("btThg,bThd->bthgd", attn, v).astype(x.dtype)
+        # qkv = jnp.reshape(qkv, (b, t, qh*d))
+        # attn_x = nn.Dense(self.hidden_size, use_bias=False, dtype=jnp.bfloat16)(qkv)
+        # x = x + attn_x
+        attn_x = tiled_multihead_attention(
+          q.transpose(1, 2),
+          k.transpose(1, 2),
+          v.transpose(1, 2),
+          token_mask,
+        )
+        attn_x = attn_x.transpose(1, 2)
+        attn_x = jnp.reshape(attn_x, (attn_x.shape[0], attn_x.shape[1], -1))
         x = x + attn_x
         
         # =========================
