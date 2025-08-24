@@ -245,12 +245,12 @@ class Block(nn.Module):
         # attn_x = nn.Dense(self.hidden_size, use_bias=False, dtype=jnp.bfloat16)(qkv)
         # x = x + attn_x
         attn_x = tiled_multihead_attention(
-          q.transpose(1, 2),
-          k.transpose(1, 2),
-          v.transpose(1, 2),
+          q.swapaxes(1, 2),
+          k.swapaxes(1, 2),
+          v.swapaxes(1, 2),
           token_mask,
         )
-        attn_x = attn_x.transpose(1, 2)
+        attn_x = attn_x.swapaxes(1, 2)
         attn_x = jnp.reshape(attn_x, (attn_x.shape[0], attn_x.shape[1], -1))
         x = x + attn_x
         
