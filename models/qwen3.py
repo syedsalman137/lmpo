@@ -93,7 +93,8 @@ def tiled_multihead_attention(
         o, m, l = state
         i_start = i_block * query_block_size
 
-        q_i = jax.lax.dynamic_slice_in_dim(q, i_start, query_block_size, axis=2)
+        q_slice_size = min(query_block_size, q.shape[2] - i_start)
+        q_i = jax.lax.dynamic_slice_in_dim(q, i_start, q_slice_size, axis=2)
 
         o_i_acc = jnp.zeros_like(q_i)
         m_i_acc = jnp.full((batch_size, num_heads, query_block_size), -jnp.inf, dtype=jnp.float32)
@@ -104,13 +105,13 @@ def tiled_multihead_attention(
         def key_loop_body(j_block, inner_state):
             o_i, m_i, l_i = inner_state
             j_start = j_block * key_block_size
-
-            k_j = jax.lax.dynamic_slice_in_dim(k, j_start, key_block_size, axis=2)
-            v_j = jax.lax.dynamic_slice_in_dim(v, j_start, key_block_size, axis=2)
+            key_slice_size = min(key_block_size, k.shape[2] - j_start)
+            k_j = jax.lax.dynamic_slice_in_dim(k, j_start, key_slice_size, axis=2)
+            v_j = jax.lax.dynamic_slice_in_dim(v, j_start, key_slice_size, axis=2)
 
             s_ij = (q_i @ k_j.swapaxes(-2, -1)) * scale
 
-            mask_j = jax.lax.dynamic_slice_in_dim(attention_mask, j_start, key_block_size, axis=1)
+            mask_j = jax.lax.dynamic_slice_in_dim(attention_mask, j_start, key_slice_size, axis=1)
             mask_j_broadcastable = mask_j[:, None, None, :]
 
             s_ij = (q_i @ k_j.swapaxes(-2, -1)) * scale
