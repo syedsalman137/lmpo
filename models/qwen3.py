@@ -66,8 +66,23 @@ def tiled_multihead_attention(
 ) -> jax.Array:
     batch_size, num_heads, num_tokens, head_size = q.shape
     num_kv_heads = k.shape[1]
-
     original_dtype = q.dtype
+
+    num_query_blocks = (num_tokens + query_block_size - 1) // query_block_size
+    padded_q_len = num_query_blocks * query_block_size
+    q_padding = padded_q_len - num_tokens
+
+    num_key_blocks = (num_tokens + key_block_size - 1) // key_block_size
+    padded_kv_len = num_key_blocks * key_block_size
+    kv_padding = padded_kv_len - num_tokens
+
+    if q_padding != 0:
+      q = jnp.pad(q, ((0, 0), (0, 0), (0, q_padding), (0, 0)))
+      attention_mask = jnp.pad(attention_mask, ((0, 0), (0, q_padding)))
+    if kv_padding != 0:
+      k = jnp.pad(k, ((0, 0), (0, 0), (0, kv_padding), (0, 0)))
+      v = jnp.pad(v, ((0, 0), (0, 0), (0, kv_padding), (0, 0)))
+
     q = q.astype(jnp.float32)
     k = k.astype(jnp.float32)
     v = v.astype(jnp.float32)
@@ -93,8 +108,7 @@ def tiled_multihead_attention(
         o, m, l = state
         i_start = i_block * query_block_size
 
-        q_slice_size = min(query_block_size, q.shape[2] - i_start)
-        q_i = jax.lax.dynamic_slice_in_dim(q, i_start, q_slice_size, axis=2)
+        q_i = jax.lax.dynamic_slice_in_dim(q, i_start, query_block_size, axis=2)
 
         o_i_acc = jnp.zeros_like(q_i)
         m_i_acc = jnp.full((batch_size, num_heads, query_block_size), -jnp.inf, dtype=jnp.float32)
@@ -105,13 +119,12 @@ def tiled_multihead_attention(
         def key_loop_body(j_block, inner_state):
             o_i, m_i, l_i = inner_state
             j_start = j_block * key_block_size
-            key_slice_size = min(key_block_size, k.shape[2] - j_start)
-            k_j = jax.lax.dynamic_slice_in_dim(k, j_start, key_slice_size, axis=2)
-            v_j = jax.lax.dynamic_slice_in_dim(v, j_start, key_slice_size, axis=2)
+            k_j = jax.lax.dynamic_slice_in_dim(k, j_start, key_block_size, axis=2)
+            v_j = jax.lax.dynamic_slice_in_dim(v, j_start, key_block_size, axis=2)
 
             s_ij = (q_i @ k_j.swapaxes(-2, -1)) * scale
 
-            mask_j = jax.lax.dynamic_slice_in_dim(attention_mask, j_start, key_slice_size, axis=1)
+            mask_j = jax.lax.dynamic_slice_in_dim(attention_mask, j_start, key_block_size, axis=1)
             mask_j_broadcastable = mask_j[:, None, None, :]
 
             s_ij = (q_i @ k_j.swapaxes(-2, -1)) * scale
