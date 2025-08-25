@@ -1,4 +1,4 @@
-from envs.base import BaseEnv, BaseState
+from lmpo.envs.base import BaseEnv, BaseState
 from dataclasses import dataclass, replace
 import numpy as np
 
