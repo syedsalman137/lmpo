@@ -64,7 +64,7 @@ def tiled_multihead_attention(
     q_pos: jax.Array,
     k_pos: jax.Array,
     causal: bool = True,
-    query_block_size: int = 1,
+    query_block_size: int = 64,
     key_block_size: int = 64
 ) -> jax.Array:
     MASK_VALUE = -1e30
@@ -75,6 +75,12 @@ def tiled_multihead_attention(
     batch_size, num_heads, q_len, head_size = q.shape
     _, num_kv_heads, kv_len, _ = k.shape
     original_dtype = q.dtype
+
+    if query_block_size > q_len:
+        query_block_size = q_len
+    
+    if key_block_size > kv_len:
+        key_block_size = kv_len
 
     # Ensure boolean masks
     q_indices = q_indices.astype(bool)
@@ -111,7 +117,7 @@ def tiled_multihead_attention(
     k = k.astype(jnp.float32)
     v = v.astype(jnp.float32)
 
-    # Expand KV heads to match Q heads (assumes divisibility as in your non-tiled path)
+    # Expand KV heads to match Q heads
     if num_kv_heads < num_heads:
         assert (num_heads % num_kv_heads) == 0, "q_heads must be a multiple of kv_heads"
         num_repeats = num_heads // num_kv_heads
@@ -125,7 +131,6 @@ def tiled_multihead_attention(
     m = jnp.full((batch_size, num_heads, q_len), MASK_VALUE, dtype=jnp.float32)
     l = jnp.zeros((batch_size, num_heads, q_len), dtype=jnp.float32)
 
-    # Helper to iterate over query blocks
     def query_loop_body(i_block, state):
         o, m, l = state
         i_start = i_block * query_block_size
@@ -138,7 +143,6 @@ def tiled_multihead_attention(
         m_i = jnp.full((batch_size, num_heads, query_block_size), MASK_VALUE, dtype=jnp.float32)
         l_i = jnp.zeros((batch_size, num_heads, query_block_size), dtype=jnp.float32)
 
-        # Always iterate over all key blocks; causality is enforced via positions.
         upper_j = num_key_blocks
 
         def key_loop_body(j_block, inner_state):
@@ -153,7 +157,6 @@ def tiled_multihead_attention(
             # [B, H, q_bs, k_bs]
             s_ij = (q_i @ k_j.swapaxes(-2, -1)) * scale
 
-            # Visibility mask: token presence + (optional) causal via positions
             mask = q_indices_i[:, None, :, None] & k_indices_j[:, None, None, :]
             if causal:
                 causal_mask = q_pos_i[:, None, :, None] >= k_pos_j[:, None, None, :]
@@ -161,7 +164,6 @@ def tiled_multihead_attention(
 
             s_ij = jnp.where(mask, s_ij, MASK_VALUE)
 
-            # Numerically stable blockwise softmax accumulation
             m_ij = jnp.max(s_ij, axis=-1)                             # [B, H, q_bs]
             m_i_new = jnp.maximum(m_i, m_ij)                          # [B, H, q_bs]
 
@@ -188,64 +190,11 @@ def tiled_multihead_attention(
 
     final_o, _, _ = jax.lax.fori_loop(0, num_query_blocks, query_loop_body, (o, m, l))
 
-    # Trim padding back to original Q length and cast back
-    # final_o = final_o[:, :, : (batch_size and 1) and 0 or 0]  # dummy line to keep JIT happy in some cases
     final_o = final_o[:, :, :((q.shape[2] - q_padding) if q_padding != 0 else q.shape[2]), :]
-    # Simpler and clearer:
     initial_q_len = padded_q_len - q_padding
     final_o = final_o[:, :, :initial_q_len, :]
 
     return final_o.astype(original_dtype)
-
-MASK_VALUE = -1e30
-
-def naive_multihead_attention(
-    q: jax.Array,
-    k: jax.Array,
-    v: jax.Array,
-    q_indices: jax.Array,
-    k_indices: jax.Array,
-    q_pos: jax.Array,
-    k_pos: jax.Array,
-    causal: bool = True,
-    query_block_size: int = 1,
-    key_block_size: int = 64
-):
-    b, h, t, d = q.shape
-    _, kh, T, _ = k.shape
-
-    # FIX 1: Reshape q to group query heads correctly.
-    # The new shape is (batch, kv_heads, num_groups, seq_len, head_dim).
-    # This groups the 'h' query heads to align with the 'kh' key/value heads.
-    q = jnp.reshape(q, (b, kh, h // kh, t, d))
-
-    # FIX 2: Update the einsum string to match the new shape of q.
-    # 'h' now represents the kv_heads dimension, and 'g' the group dimension.
-    # The dot product is between q ('...gtd') and k ('...Td').
-    # The output ('...gtT') correctly preserves the head and group dims.
-    qk = jnp.einsum("bhgtd,bhTd->bhgtT", q, k) * (d ** -0.5)
-    
-    # Reshape to flatten the head dimensions for masking and softmax.
-    qk = jnp.reshape(qk, (b, h, t, T))
-    
-    mask = q_indices[:, None, :, None] & k_indices[:, None, None, :]
-
-    if causal:
-        causal_mask = q_pos[:, None, :, None] >= k_pos[:, None, None, :]
-        mask &= causal_mask
-        
-    qk = jnp.where(mask, qk, MASK_VALUE)
-    scores = jax.nn.softmax(qk, axis=-1)
-    
-    # Reshape scores back to the grouped format for the final einsum.
-    scores = jnp.reshape(scores, (b, kh, h // kh, t, T))
-    
-    # FIX 3: Update the final einsum to match the new grouped shape.
-    qkv = jnp.einsum("bhgtT,bhTd->bhgtd", scores, v)
-    
-    # Reshape the output to the original query tensor shape.
-    qkv = jnp.reshape(qkv, (b, h, t, d))
-    return qkv
 
 class KVCache(flax.struct.PyTreeNode):
     k: list[jax.Array]
