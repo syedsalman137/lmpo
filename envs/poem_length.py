@@ -14,7 +14,7 @@ class PoemLengthEnv(BaseEnv):
 
     def reset(self, idx):
         imagenet_labels = open('inference/imagenet_labels.txt').read().splitlines()
-        msg = f'Write three sentences about {imagenet_labels[idx % 1000]}'
+        msg = f'Write a Haiku on {imagenet_labels[idx % 1000]}'
         output_tokens = self.tokenizer.apply_chat_template(
             [{"role": "user", "content": msg}],
             add_generation_prompt=True,

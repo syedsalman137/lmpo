@@ -99,7 +99,7 @@ if __name__ == "__main__":
     tokenizer = create_tokenizer(ckpt_dir)
 
     labels = ['cat', 'dog', 'bird', 'fish', 'elephant', 'tiger', 'lion', 'giraffe', 'zebra', 'monkey']
-    poem_prompts = [f'Write a haiku about of {labels[np.random.randint(len(labels))]}' for _ in range(len(jax.local_devices()))]
+    poem_prompts = [f'Write a haiku about {labels[np.random.randint(len(labels))]}' for _ in range(len(jax.local_devices()))]
 
     pad_id = 0
     token_list = [
