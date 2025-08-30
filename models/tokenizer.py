@@ -10,11 +10,8 @@ class Tokenizer():
     def __init__(self, hf_tokenizer):
         self.hf_tokenizer = hf_tokenizer
 
-    def apply_chat_template(self, messages, add_generation_prompt=False, enable_thinking=False):
-        toks = self.hf_tokenizer.apply_chat_template(messages, add_generation_prompt=add_generation_prompt, enable_thinking=enable_thinking)
-        if enable_thinking:
-            toks += [151667] # <think>.
-        return toks
+    def apply_chat_template(self, messages, **kwargs):
+        return self.hf_tokenizer.apply_chat_template(messages, **kwargs)
     
     def get_eos_token_id(self):
         return self.hf_tokenizer.eos_token_id
@@ -25,8 +22,8 @@ class Tokenizer():
     def decode(self, toks):
         return self.hf_tokenizer.decode(toks)
     
-    def encode(self, text):
-        return self.hf_tokenizer.encode(text)
+    def encode(self, text, add_special_tokens=True):
+        return self.hf_tokenizer.encode(text, add_special_tokens=add_special_tokens)
 
 def create_tokenizer(dir):
     config = json.loads(Path(dir+'tokenizer_config.json').read_text())
