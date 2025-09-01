@@ -54,7 +54,7 @@ config = ml_collections.ConfigDict({
     'test_interval': 4000,
     'eval_batches': 50,
     'train_batch_per_device': 2,   # increase until OOM
-    'seed': 0,
+    'seed': 42,
 
     # Optimizer
     'lr': 5e-5,
@@ -109,11 +109,11 @@ def _build_example(tokenizer, ex, eos_id):
         enable_thinking=False,
     )
 
-    prompt_match = re.match(r'<\|im_start\|>user.*<\|im_end\|>\n', chat_ex, re.DOTALL)
+    prompt_match = re.search(r'<\|im_start\|>user.*<\|im_end\|>\n', chat_ex, re.DOTALL)
     start_prompt, end_prompt = prompt_match.span()
     prompt = chat_ex[start_prompt:end_prompt]
 
-    response_match = re.match(r'<\|im_start\|>assistant.*', chat_ex, re.DOTALL)
+    response_match = re.search(r'<\|im_start\|>assistant.*', chat_ex, re.DOTALL)
     start_response, end_response = response_match.span()
     response = chat_ex[start_response:end_response]
 
@@ -178,16 +178,18 @@ class JsonlBatcher:
 
         if len(self.raw) == 0:
             raise ValueError(f"No examples found in {path} for host {host_id}.")
-
+        self.indices = jnp.arange(len(self.raw))
         # self._reshuffle()
+        self.ptr = 0
 
     def _reshuffle(self):
         self.indices = self.rng.permutation(len(self.raw)).tolist()
         self.ptr = 0
 
     def _next_example(self):
-        if self.ptr >= len(self.indices):
-            self._reshuffle()
+        # if self.ptr >= len(self.indices):
+        #     self._reshuffle()
+        self.ptr = 0
         ex = self.raw[self.indices[self.ptr]]
         self.ptr += 1
         return ex
@@ -242,12 +244,11 @@ model, params = create_model_from_ckpt(ckpt_dir)
 # )
 
 rng = jax.random.PRNGKey(FLAGS.seed)
-rng, optaxrng = jax.random.split(rng)
 tx = optax.chain(
     optax.clip_by_global_norm(FLAGS.grad_clip_norm),
     optax.noisy_sgd(
         learning_rate=FLAGS.lr,
-        key=optaxrng,
+        key=0,
     ),
 )
 init_fn = partial(TrainState.create_with_params, model_def=model, tx=tx, use_ema=False)
@@ -363,13 +364,12 @@ def sft_eval_step(train_state: TrainState, token_batch, loss_mask):
     acc = jnp.sum((preds == text_tgt) * mask) / denom
     return {'cross_entropy': ce, 'ppl': ppl, 'accuracy': acc}
 
-@jax.jit
-def sft_test_step(train_state: TrainState, ex, loss_mask):
-    def get_integer_answer(generation):
+def sft_test_step(train_state: TrainState, ex):
+    def get_integer_answer(text):
         try:
-            boxed_integers = re.findall(r'\\boxed{(\d[\d,_\s]*)}', generation)
+            boxed_integers = re.findall(r'\\boxed{(\d[\d,_\s]*)}', text)
             if not boxed_integers:
-                normal_integers = re.findall(r'(\d[\d,_\s]*)', generation)
+                normal_integers = re.findall(r'(\d[\d,_\s]*)', text)
                 if not normal_integers:
                     return 0
                 return int(re.sub(r'[_,\s]+', '', normal_integers[-1]))
@@ -377,8 +377,14 @@ def sft_test_step(train_state: TrainState, ex, loss_mask):
         except ValueError:
             return 0
 
-    prompt = ex["prompt"]
-    response = ex["response"]
+    if 'prompt' in ex and 'response' in ex:
+        prompt, response = ex['prompt'], ex['response']
+    elif 'input' in ex and 'output' in ex:
+        prompt, response = ex['input'], ex['output']
+    elif 'text' in ex:
+        prompt, response = "", ex['text']
+    else:
+        raise ValueError(f"Unsupported example keys: {list(ex.keys())}")
 
     prompt_tokens = tokenizer.apply_chat_template(
         [
@@ -390,11 +396,11 @@ def sft_test_step(train_state: TrainState, ex, loss_mask):
 
     num_response_tokens = len(tokenizer.encode(response))
     num_generation_tokens = -(-num_response_tokens // 1024)
-
+    rng = jax.random.PRNGKey(FLAGS.seed)
     tokens_out = autoregressive_sample(
-        model,
-        params,
-        prompt_tokens,
+        train_state.model_def,
+        train_state.params,
+        jnp.array([prompt_tokens]),
         num_generation_tokens,
         rng,
         temp=0.6,
@@ -404,7 +410,7 @@ def sft_test_step(train_state: TrainState, ex, loss_mask):
         force_answer_at=-1
     )
     tokens_out = host_gather(tokens_out)
-    output = tokenizer.decode(tokens_out)
+    output = tokenizer.decode(tokens_out[0])
 
     target_answer = get_integer_answer(response)
     output_answer = get_integer_answer(output)
@@ -456,10 +462,10 @@ for step in tqdm.tqdm(range(FLAGS.train_steps), disable=(host_id != 0)):
     if test_ds is not None and step > 0 and step % FLAGS.test_interval == 0:
         test_metrics = {'answer accuracy': []}
         for test_ex in test_ds:
-            output, target = sft_test_step(test_ex)
-            for k in eval_metrics:
+            output, target = sft_test_step(train_state, test_ex)
+            for k in test_metrics:
                 test_metrics[k].append(output == target)
-        test_info = {f'test/{k}': float(np.mean(v)) for k, v in eval_metrics.items()}
+        test_info = {f'test/{k}': float(np.mean(v)) for k, v in test_metrics.items()}
         print(test_info)
         if host_id == 0 and FLAGS.enable_wandb:
             wandb.log(test_info, commit=False)
