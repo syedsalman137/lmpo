@@ -129,7 +129,9 @@ class Block(nn.Module):
         q_offsets = jnp.ones((b, ), dtype=jnp.int32) * q_offset
 
         attention = pallas_flash_attention if (
-            jax.devices()[0].platform == 'tpu'
+            jax.devices()[0].platform == 'tpu' and (
+                (t >= 512 and T >= 512) or (t * T >= 2048 * 2048)
+            )
         ) else naive_multihead_attention
         attn_x = attention(
             q.swapaxes(1, 2),
