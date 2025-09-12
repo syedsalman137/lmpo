@@ -3,8 +3,6 @@ import jax.numpy as jnp
 
 from lmpo.kernels.flash_attention import flash_attention, BlockSizes
 
-MASK_VALUE = 1e-30
-
 def naive_multihead_attention(
     q: jax.Array,
     k: jax.Array,
@@ -27,25 +25,22 @@ def naive_multihead_attention(
   scaled_scores = scores / jnp.sqrt(head_size)
   mask = None
   if q_idx is not None and k_idx is not None:
-    mask = q_idx[:, :, None] & k_idx[:, None, :]
-    mask = mask.astype(bool)
-
-  if q_offsets is None:
-    q_offsets = jnp.zeros((batch_size, ), dtype=jnp.int32)
+    mask = jnp.logical_and(
+        q_idx[:, None, :, None],
+        k_idx[:, None, None, :]
+    )
+    mask = mask.astype(jnp.bool_)
 
   if causal:
     mask_shape  = (batch_size, 1, num_tokens, num_kv_tokens)
-    row_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 2) + q_offsets[:, None, None, None]
+    row_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 2)
+    if q_offsets is not None:
+      row_ids += q_offsets[:, None, None, None]
     col_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 3)
-    causal_mask = col_ids <= row_ids
-    mask = causal_mask if mask is None else jnp.logical_and(mask, causal_mask).astype(bool)
+    causal_mask = (col_ids <= row_ids).astype(jnp.bool_)
+    mask = causal_mask if mask is None else jnp.logical_and(mask, causal_mask)
 
-  row_has_any = jnp.ones((batch_size, 1, num_tokens), dtype=bool)
-  if mask is not None:
-    row_has_any = jnp.any(mask, axis=-1)
-    scaled_scores = jnp.where(mask, scaled_scores, MASK_VALUE)
-
-  weights = jnp.where(row_has_any[..., None], jax.nn.softmax(scaled_scores, axis=-1), 0.0)
+  weights = jax.nn.softmax(scaled_scores, axis=-1, where=None if mask is None else mask)
   attention_output = weights @ v
 
   return attention_output
@@ -120,15 +115,15 @@ def tiled_multihead_attention(
     q: jax.Array,
     k: jax.Array,
     v: jax.Array,
-    q_indices: jax.Array,
-    k_indices: jax.Array,
-    q_pos: jax.Array,
-    k_pos: jax.Array,
+    q_offsets: jax.Array=None,
+    q_idx: jax.Array=None,
+    k_idx: jax.Array=None,
     causal: bool = True,
     query_block_size: int = 64,
     key_block_size: int = 64
 ) -> jax.Array:
     MASK_VALUE = -1e30
+    EPS = 1e-6
 
     # Shapes:
     # q: [B, q_heads, q_len, D]
@@ -144,8 +139,9 @@ def tiled_multihead_attention(
         key_block_size = kv_len
 
     # Ensure boolean masks
-    q_indices = q_indices.astype(bool)
-    k_indices = k_indices.astype(bool)
+    if q_idx is not None:
+        q_idx = q_idx.astype(bool)
+        k_idx = k_idx.astype(bool)
 
     # Figure out block counts and any padding independently for Q and KV
     num_query_blocks = (q_len + query_block_size - 1) // query_block_size
@@ -159,24 +155,19 @@ def tiled_multihead_attention(
     # Pad Q and metadata if needed
     if q_padding != 0:
         q = jnp.pad(q, ((0, 0), (0, 0), (0, q_padding), (0, 0)))
-        q_indices = jnp.pad(q_indices, ((0, 0), (0, q_padding)), constant_values=False)
-        q_pos = jnp.pad(q_pos, ((0, 0), (0, q_padding)), constant_values=-1)
+        if q_idx is not None:
+            q_idx = jnp.pad(q_idx, ((0, 0), (0, q_padding)), constant_values=False)
 
     # Pad K/V and metadata if needed
     if kv_padding != 0:
         k = jnp.pad(k, ((0, 0), (0, 0), (0, kv_padding), (0, 0)))
         v = jnp.pad(v, ((0, 0), (0, 0), (0, kv_padding), (0, 0)))
-        k_indices = jnp.pad(k_indices, ((0, 0), (0, kv_padding)), constant_values=False)
-        k_pos = jnp.pad(k_pos, ((0, 0), (0, kv_padding)), constant_values=-1)
+        if k_idx is not None:
+            k_idx = jnp.pad(k_idx, ((0, 0), (0, kv_padding)), constant_values=False)
 
     # Refresh lengths after padding
     q_len = q.shape[2]
     kv_len = k.shape[2]
-
-    # Upcast for compute
-    q = q.astype(jnp.float32)
-    k = k.astype(jnp.float32)
-    v = v.astype(jnp.float32)
 
     # Expand KV heads to match Q heads
     if num_kv_heads < num_heads:
@@ -185,10 +176,10 @@ def tiled_multihead_attention(
         k = jnp.repeat(k, repeats=num_repeats, axis=1)
         v = jnp.repeat(v, repeats=num_repeats, axis=1)
 
-    scale = 1.0 / jnp.sqrt(jnp.array(head_size, dtype=jnp.float32))
+    scale = 1.0 / jnp.sqrt(head_size)
 
     # Output and running stats
-    o = jnp.zeros_like(q, dtype=jnp.float32)
+    o = jnp.zeros_like(q, dtype=q.dtype)
     m = jnp.full((batch_size, num_heads, q_len), MASK_VALUE, dtype=jnp.float32)
     l = jnp.zeros((batch_size, num_heads, q_len), dtype=jnp.float32)
 
@@ -197,10 +188,12 @@ def tiled_multihead_attention(
         i_start = i_block * query_block_size
 
         q_i = jax.lax.dynamic_slice_in_dim(q, i_start, query_block_size, axis=2)
-        q_indices_i = jax.lax.dynamic_slice_in_dim(q_indices, i_start, query_block_size, axis=1)
-        q_pos_i = jax.lax.dynamic_slice_in_dim(q_pos, i_start, query_block_size, axis=1)
 
-        o_i = jnp.zeros_like(q_i)
+        q_idx_i = None
+        if q_idx is not None:
+            q_idx_i = jax.lax.dynamic_slice_in_dim(q_idx, i_start, query_block_size, axis=1)
+
+        o_i = jnp.zeros_like(q_i, dtype=q_i.dtype)
         m_i = jnp.full((batch_size, num_heads, query_block_size), MASK_VALUE, dtype=jnp.float32)
         l_i = jnp.zeros((batch_size, num_heads, query_block_size), dtype=jnp.float32)
 
@@ -212,29 +205,58 @@ def tiled_multihead_attention(
 
             k_j = jax.lax.dynamic_slice_in_dim(k, j_start, key_block_size, axis=2)
             v_j = jax.lax.dynamic_slice_in_dim(v, j_start, key_block_size, axis=2)
-            k_indices_j = jax.lax.dynamic_slice_in_dim(k_indices, j_start, key_block_size, axis=1)
-            k_pos_j = jax.lax.dynamic_slice_in_dim(k_pos, j_start, key_block_size, axis=1)
 
+            k_idx_j = None
+            if k_idx is not None:
+                k_idx_j = jax.lax.dynamic_slice_in_dim(k_idx, j_start, key_block_size, axis=1)
+            
             # [B, H, q_bs, k_bs]
-            s_ij = (q_i @ k_j.swapaxes(-2, -1)) * scale
+            s_ij = jax.lax.dot_general(
+                q_i, k_j, (((3, ), (3, )), ((0, 1, ), (0, 1, ))), preferred_element_type=jnp.float32
+            )
+            
+            if scale is not None:
+                s_ij *= scale
 
-            mask = q_indices_i[:, None, :, None] & k_indices_j[:, None, None, :]
+            mask = None
+            if q_idx_i is not None:
+                padding_mask = jnp.logical_and(
+                    q_idx_i[:, None, :, None],
+                    k_idx_j[:, None, None, :]
+                )
+                mask = padding_mask
+
             if causal:
-                causal_mask = q_pos_i[:, None, :, None] >= k_pos_j[:, None, None, :]
-                mask &= causal_mask
+                row_ids = jax.lax.broadcasted_iota(jnp.int32, (batch_size, 1, query_block_size, 1), 2)
+                col_ids = jax.lax.broadcasted_iota(jnp.int32, (batch_size, 1, 1, key_block_size), 3)
+                if q_offsets is not None:
+                    row_ids += q_offsets[:, None, None, None]
+                causal_mask = (col_ids <= row_ids).astype(jnp.bool_)
+                mask = (
+                    causal_mask if mask is None else jnp.logical_and(mask, causal_mask)
+                )
 
-            s_ij = jnp.where(mask, s_ij, MASK_VALUE)
+            s_ij = s_ij if mask is None else jnp.where(mask, s_ij, MASK_VALUE)
 
             m_ij = jnp.max(s_ij, axis=-1)                             # [B, H, q_bs]
             m_i_new = jnp.maximum(m_i, m_ij)                          # [B, H, q_bs]
 
-            p_ij = jnp.exp(s_ij - m_i_new[..., None])                 # [B, H, q_bs, k_bs]
+            row_has_any = (
+                jnp.ones(s_ij.shape[0], ) if mask is None else jnp.any(mask, axis=-1)
+            )
+            p_ij = jnp.exp(
+                s_ij - jnp.where(
+                    row_has_any,
+                    m_i_new[..., None],
+                    0.0
+                )
+            )                 # [B, H, q_bs, k_bs]
             scale_factor = jnp.exp(m_i - m_i_new)                     # [B, H, q_bs]
             l_i_new = scale_factor * l_i + jnp.sum(p_ij, axis=-1)     # [B, H, q_bs]
-            l_i_new_safe = jnp.where(l_i_new == 0, 1e-6, l_i_new)
+            l_i_new_inv = jnp.where(l_i_new > 0, 1.0 / l_i_new, 0.0)
 
-            o_i_rescaled = o_i * (scale_factor * l_i / l_i_new_safe)[..., None]
-            v_contribution = (p_ij @ v_j) / l_i_new_safe[..., None]
+            o_i_rescaled = o_i * ((scale_factor * l_i * l_i_new_inv))[..., None]
+            v_contribution = (p_ij @ v_j) * l_i_new_inv[..., None]
             o_i_new = o_i_rescaled + v_contribution
 
             return o_i_new, m_i_new, l_i_new
@@ -255,4 +277,4 @@ def tiled_multihead_attention(
     initial_q_len = padded_q_len - q_padding
     final_o = final_o[:, :, :initial_q_len, :]
 
-    return final_o.astype(original_dtype)
+    return final_o
