@@ -130,7 +130,7 @@ class Block(nn.Module):
 
         attention = pallas_flash_attention if (
             jax.devices()[0].platform == 'tpu' and (
-                (t >= 512 and T >= 512) or (t * T >= 2048 * 2048)
+                (t >= 512 and T >= 512) or (t * T >= 2048 * 512)
             )
         ) else naive_multihead_attention
         attn_x = attention(
