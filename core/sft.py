@@ -1,4 +1,5 @@
 import re, os, sys, json, time, shutil
+from typing import Iterable
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -8,6 +9,17 @@ import tqdm
 import wandb
 import ml_collections
 from absl import flags
+
+def batched(iterable: Iterable, n: int):
+    item_list = []
+    for i, item in enumerate(iterable):
+        item_list.append(item)
+        if (i + 1) % n == 0 and i != 0:
+            yield item_list
+            del item_list
+            item_list = []
+    yield item_list
+    del item_list
 
 try:
     from jax.experimental.compilation_cache import compilation_cache as cc
@@ -232,23 +244,11 @@ class JsonlBatcher:
 ckpt_dir = FLAGS.model_dir
 model, params = create_model_from_ckpt(ckpt_dir)
 
-# tx = optax.chain(
-#     optax.clip_by_global_norm(FLAGS.grad_clip_norm),
-#     optax.adamw(
-#         learning_rate=FLAGS.lr,
-#         b1=FLAGS.adam_b1,
-#         b2=FLAGS.adam_b2,
-#         eps=FLAGS.adam_eps,
-#         weight_decay=FLAGS.weight_decay,
-#     )
-# )
-
 rng = jax.random.PRNGKey(FLAGS.seed)
 tx = optax.chain(
     optax.clip_by_global_norm(FLAGS.grad_clip_norm),
-    optax.noisy_sgd(
+    optax.sgd(
         learning_rate=FLAGS.lr,
-        key=0,
     ),
 )
 init_fn = partial(TrainState.create_with_params, model_def=model, tx=tx, use_ema=False)
@@ -291,7 +291,7 @@ if FLAGS.eval_dataset_path:
     )
 
 test_ds = None
-if FLAGS.eval_dataset_path:
+if FLAGS.test_dataset_path:
     with open(FLAGS.test_dataset_path, 'r') as f:
         test_ds = [json.loads(line) for line in f if line.strip()]
     
@@ -364,7 +364,7 @@ def sft_eval_step(train_state: TrainState, token_batch, loss_mask):
     acc = jnp.sum((preds == text_tgt) * mask) / denom
     return {'cross_entropy': ce, 'ppl': ppl, 'accuracy': acc}
 
-def sft_test_step(train_state: TrainState, ex):
+def sft_test_step(train_state: TrainState, batch_ex):
     def get_integer_answer(text):
         try:
             boxed_integers = re.findall(r'\\boxed{(\d[\d,_\s]*)}', text)
@@ -377,30 +377,32 @@ def sft_test_step(train_state: TrainState, ex):
         except ValueError:
             return 0
 
-    if 'prompt' in ex and 'response' in ex:
-        prompt, response = ex['prompt'], ex['response']
-    elif 'input' in ex and 'output' in ex:
-        prompt, response = ex['input'], ex['output']
-    elif 'text' in ex:
-        prompt, response = "", ex['text']
-    else:
-        raise ValueError(f"Unsupported example keys: {list(ex.keys())}")
+    def get_prompt_n_response(ex):
+        if 'prompt' in ex and 'response' in ex:
+            prompt, response = ex['prompt'], ex['response']
+        elif 'input' in ex and 'output' in ex:
+            prompt, response = ex['input'], ex['output']
+        elif 'text' in ex:
+            prompt, response = "", ex['text']
+        else:
+            raise ValueError(f"Unsupported example keys: {list(ex.keys())}")
+        return prompt
 
-    prompt_tokens = tokenizer.apply_chat_template(
-        [
-            {"role": "user", "content": prompt}
-        ],
-        add_generation_prompt=True,
-        enable_thinking=False
-    )
-
-    num_response_tokens = len(tokenizer.encode(response))
-    num_generation_tokens = -(-num_response_tokens // 1024)
+    prompt_list = [get_prompt_n_response(ex)[0] for ex in batch_ex]
+    response_list = [get_prompt_n_response(ex)[1] for ex in batch_ex]
+    prompt_token_list = [
+        tokenizer.apply_chat_template({"role": "user", "content": prompt})
+        for prompt in prompt_list
+    ]
+    prompt_token_batch = pad_and_collate(prompt_token_list, pad_id=0, force_length=128)
+    prompt_token_batch = shard_data_fn(prompt_token_batch)
+    num_response_tokens = 40960
+    num_generation_tokens = FLAGS.max_seq_len
     rng = jax.random.PRNGKey(FLAGS.seed)
     tokens_out = autoregressive_sample(
         train_state.model_def,
         train_state.params,
-        jnp.array([prompt_tokens]),
+        prompt_token_batch,
         num_generation_tokens,
         rng,
         temp=0.6,
@@ -410,12 +412,14 @@ def sft_test_step(train_state: TrainState, ex):
         force_answer_at=-1
     )
     tokens_out = host_gather(tokens_out)
-    output = tokenizer.decode(tokens_out[0])
+    output_list = [tokenizer.decode(row) for row in tokens_out]
 
-    target_answer = get_integer_answer(response)
-    output_answer = get_integer_answer(output)
+    target_answer_list = [get_integer_answer(response)
+                    for response in response_list]
+    output_answer_list = [get_integer_answer(output)
+                    for output in output_list]
 
-    return output_answer, target_answer
+    return output_answer_list, target_answer_list
 
 # -----------------------
 # Train loop
@@ -459,12 +463,14 @@ for step in tqdm.tqdm(range(FLAGS.train_steps), disable=(host_id != 0)):
         if host_id == 0 and FLAGS.enable_wandb:
             wandb.log(eval_info, commit=False)
     
-    if test_ds is not None and step > 0 and step % FLAGS.test_interval == 0:
+    if test_ds is not None and step % FLAGS.test_interval == 0:
         test_metrics = {'answer accuracy': []}
-        for test_ex in test_ds:
-            output, target = sft_test_step(train_state, test_ex)
+        for test_ex_batch in batched(test_ds):
+            output_list, target_list = sft_test_step(train_state, test_ex_batch)
             for k in test_metrics:
-                test_metrics[k].append(output == target)
+                test_metrics[k].extend(
+                    zip(output_list, target_list)
+                )
         test_info = {f'test/{k}': float(np.mean(v)) for k, v in test_metrics.items()}
         print(test_info)
         if host_id == 0 and FLAGS.enable_wandb:
