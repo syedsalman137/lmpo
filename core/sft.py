@@ -55,7 +55,7 @@ config = ml_collections.ConfigDict({
     'dataset_path': '/path/to/train.jsonl',
     'eval_dataset_path': '',       # optional
     'test_dataset_path': '',       # optional
-    'max_seq_len': 40960,
+    'max_seq_len': 38912,
     'loss_on_prompt': 0,           # 0 = only compute loss on response; 1 = also include prompt
     'truncate_direction': 'right', # 'right' or 'left' truncation
 
@@ -66,6 +66,8 @@ config = ml_collections.ConfigDict({
     'test_interval': 4000,
     'eval_batches': 50,
     'train_batch_per_device': 2,   # increase until OOM
+    'eval_batch_per_device': 4,   # increase until OOM
+    'test_batch_per_device': 1,   # increase until OOM
     'seed': 42,
 
     # Optimizer
@@ -279,10 +281,11 @@ train_iter = JsonlBatcher(
 
 eval_iter = None
 if FLAGS.eval_dataset_path:
+    eval_per_host_batch = local_device_count * FLAGS.eval_batch_per_device
     eval_iter = JsonlBatcher(
         path=FLAGS.eval_dataset_path,
         tokenizer=tokenizer,
-        batch_size_per_host=per_host_batch,
+        batch_size_per_host=eval_per_host_batch,
         max_len=FLAGS.max_seq_len,
         loss_on_prompt=FLAGS.loss_on_prompt,
         truncate_direction=FLAGS.truncate_direction,
@@ -386,18 +389,23 @@ def sft_test_step(train_state: TrainState, batch_ex):
             prompt, response = "", ex['text']
         else:
             raise ValueError(f"Unsupported example keys: {list(ex.keys())}")
-        return prompt
+        return prompt, response
 
     prompt_list = [get_prompt_n_response(ex)[0] for ex in batch_ex]
     response_list = [get_prompt_n_response(ex)[1] for ex in batch_ex]
     prompt_token_list = [
-        tokenizer.apply_chat_template({"role": "user", "content": prompt})
+        tokenizer.apply_chat_template([{"role": "user", "content": prompt}])
         for prompt in prompt_list
     ]
+    response_token_list = [
+        tokenizer.apply_chat_template([{"role": "user", "content": response}])
+        for response in response_list
+    ]
+    max_response_tokens = len(max(response_token_list, key=len))
+    num_generation_tokens = min(FLAGS.max_seq_len, -(-max_response_tokens // 4096) * 4096)
     prompt_token_batch = pad_and_collate(prompt_token_list, pad_id=0, force_length=128)
     prompt_token_batch = shard_data_fn(prompt_token_batch)
-    num_response_tokens = 40960
-    num_generation_tokens = FLAGS.max_seq_len
+
     rng = jax.random.PRNGKey(FLAGS.seed)
     tokens_out = autoregressive_sample(
         train_state.model_def,
@@ -407,8 +415,8 @@ def sft_test_step(train_state: TrainState, batch_ex):
         rng,
         temp=0.6,
         pad_id=0,
-        data_shard=None,
-        no_shard=None,
+        data_shard=data_shard,
+        no_shard=no_shard,
         force_answer_at=-1
     )
     tokens_out = host_gather(tokens_out)
@@ -465,7 +473,8 @@ for step in tqdm.tqdm(range(FLAGS.train_steps), disable=(host_id != 0)):
     
     if test_ds is not None and step % FLAGS.test_interval == 0:
         test_metrics = {'answer accuracy': []}
-        for test_ex_batch in batched(test_ds):
+        test_per_host_batch = local_device_count * FLAGS.test_batch_per_device * 
+        for test_ex_batch in batched(test_ds, n=test_per_host_batch):
             output_list, target_list = sft_test_step(train_state, test_ex_batch)
             for k in test_metrics:
                 test_metrics[k].extend(
