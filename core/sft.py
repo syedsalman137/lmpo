@@ -473,7 +473,7 @@ for step in tqdm.tqdm(range(FLAGS.train_steps), disable=(host_id != 0)):
     
     if test_ds is not None and step % FLAGS.test_interval == 0:
         test_metrics = {'answer accuracy': []}
-        test_per_host_batch = local_device_count * FLAGS.test_batch_per_device * 
+        test_per_host_batch = local_device_count * FLAGS.test_batch_per_device 
         for test_ex_batch in batched(test_ds, n=test_per_host_batch):
             output_list, target_list = sft_test_step(train_state, test_ex_batch)
             for k in test_metrics:
