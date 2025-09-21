@@ -123,7 +123,7 @@ def _build_example(tokenizer, ex, eos_id):
         enable_thinking=False,
     )
 
-    prompt_match = re.search(r'<\|im_start\|>user.*<\|im_end\|>\n', chat_ex, re.DOTALL)
+    prompt_match = re.search(r'<\|im_start\|>user.*?<\|im_end\|>\n', chat_ex, re.DOTALL)
     start_prompt, end_prompt = prompt_match.span()
     prompt = chat_ex[start_prompt:end_prompt]
 
@@ -201,9 +201,9 @@ class JsonlBatcher:
         self.ptr = 0
 
     def _next_example(self):
-        # if self.ptr >= len(self.indices):
+        if self.ptr >= len(self.indices):
+            self.ptr = 0
         #     self._reshuffle()
-        self.ptr = 0
         ex = self.raw[self.indices[self.ptr]]
         self.ptr += 1
         return ex
@@ -436,6 +436,20 @@ rng = jax.random.PRNGKey(FLAGS.seed + host_id)
 step_start_time = time.time()
 
 for step in tqdm.tqdm(range(FLAGS.train_steps), disable=(host_id != 0)):
+    if test_ds is not None and step % FLAGS.test_interval == 0:
+        test_metrics = {'answer accuracy': []}
+        test_per_host_batch = local_device_count * FLAGS.test_batch_per_device 
+        for test_ex_batch in batched(test_ds, n=test_per_host_batch):
+            output_list, target_list = sft_test_step(train_state, test_ex_batch)
+            for k in test_metrics:
+                test_metrics[k].extend(
+                    zip(output_list, target_list)
+                )
+        test_info = {f'test/{k}': float(np.mean(v)) for k, v in test_metrics.items()}
+        print(test_info)
+        if host_id == 0 and FLAGS.enable_wandb:
+            wandb.log(test_info, commit=False)
+            
     tokens_np, mask_np = train_iter.next_batch()
     tokens = shard_data_fn(jnp.array(tokens_np))
     mask = shard_data_fn(jnp.array(mask_np))
@@ -470,20 +484,6 @@ for step in tqdm.tqdm(range(FLAGS.train_steps), disable=(host_id != 0)):
         print(eval_info)
         if host_id == 0 and FLAGS.enable_wandb:
             wandb.log(eval_info, commit=False)
-    
-    if test_ds is not None and step % FLAGS.test_interval == 0:
-        test_metrics = {'answer accuracy': []}
-        test_per_host_batch = local_device_count * FLAGS.test_batch_per_device 
-        for test_ex_batch in batched(test_ds, n=test_per_host_batch):
-            output_list, target_list = sft_test_step(train_state, test_ex_batch)
-            for k in test_metrics:
-                test_metrics[k].extend(
-                    zip(output_list, target_list)
-                )
-        test_info = {f'test/{k}': float(np.mean(v)) for k, v in test_metrics.items()}
-        print(test_info)
-        if host_id == 0 and FLAGS.enable_wandb:
-            wandb.log(test_info, commit=False)
 
     # Save
     if FLAGS.save_dir != "" and step > 0 and step % FLAGS.save_interval == 0:
