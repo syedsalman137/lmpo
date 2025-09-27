@@ -29,7 +29,7 @@ try:
 except:
     pass
 
-from lmpo.models.qwen3 import create_model_from_ckpt
+from lmpo.models.qwen3 import create_model_from_ckpt, KVCache
 from lmpo.models.tokenizer import create_tokenizer
 from lmpo.core.sampling import pad_and_collate, autoregressive_sample
 from lmpo.utils.sharding import create_sharding, host_gather
@@ -65,13 +65,14 @@ config = ml_collections.ConfigDict({
     'eval_interval': 1000,
     'test_interval': 4000,
     'eval_batches': 50,
+    'sft_update_step_chunk_size': 4096,
     'train_batch_per_device': 2,   # increase until OOM
     'eval_batch_per_device': 4,   # increase until OOM
     'test_batch_per_device': 1,   # increase until OOM
     'seed': 42,
 
     # Optimizer
-    'lr': 5e-5,
+    'lr': 1e-5,
     'adam_b1': 0.9,
     'adam_b2': 0.95,
     'adam_eps': 1e-8,
@@ -227,7 +228,7 @@ class JsonlBatcher:
 
         xs = []
         ms = []
-        for prompt_ids, token_ids in zip(prompt_ids_list, response_ids_list):
+        for prompt_ids, response_ids in zip(prompt_ids_list, response_ids_list):
             tokens, mask = _concat_truncate_and_pad(
                 prompt_ids=prompt_ids,
                 response_ids=response_ids,
@@ -302,52 +303,129 @@ if FLAGS.test_dataset_path:
 # -----------------------
 # Jitted steps
 # -----------------------
-@partial(jax.jit, out_shardings=(train_state_shard, None))
-def sft_update_step(train_state: TrainState, token_batch, loss_mask):
-    # token_batch: [B, L], loss_mask: [B, L] with 1s where we apply the loss
-    text_in = token_batch[:, :-1]
-    text_tgt = token_batch[:, 1:]
-    mask = loss_mask[:, 1:]  # align mask with targets
-    attn_mask = (text_in != pad_id).astype(jnp.int32)
 
-    def loss_fn(grad_params):
-        logits, _ = train_state.call_model(text_in, attn_mask, cache=None, params=grad_params)  # [B, T, V]
-        log_probs = jax.nn.log_softmax(logits, axis=-1)
-        nll = -jnp.sum(log_probs * jax.nn.one_hot(text_tgt, logits.shape[-1]), axis=-1)  # [B, T]
-        denom = jnp.maximum(jnp.sum(mask), 1)
-        loss = jnp.sum(nll * mask) / denom
+@partial(jax.jit, static_argnames=('chunk_len',),
+         out_shardings=(train_state_shard, None))
+def _sft_update_step_core(train_state: TrainState,
+                          text_in_p: jnp.ndarray,     # [B, T_p]
+                          text_tgt_p: jnp.ndarray,    # [B, T_p]
+                          mask_p: jnp.ndarray,        # [B, T_p], float32
+                          chunk_len: int = 4096):
+    B, T_p = text_in_p.shape
+    steps = T_p // chunk_len  # exact since we pad to a multiple
+    # Denominator over original tokens (padded mask contains zeros for pads)
+    denom_total = jnp.maximum(jnp.sum(mask_p, dtype=jnp.float32), 1.0)
+    trained_tokens_per_seq = jnp.mean(jnp.sum(mask_p, axis=-1, dtype=jnp.float32))
 
-        # metrics
-        ce = loss
-        preds = jnp.argmax(logits, axis=-1)
-        correct = jnp.sum((preds == text_tgt) * mask)
-        acc = correct / denom
-        entropy = -jnp.sum(jax.nn.softmax(logits) * log_probs, axis=-1)
-        ent_avg = jnp.sum(entropy * mask) / denom
+    # KV cache sized for full padded length to preserve left-to-right context
+    model_def = train_state.model_def
+    cache0 = KVCache.create(
+        num_layers=model_def.num_layers,
+        batch_size=B,
+        max_seq_len=T_p,
+        head_dim=model_def.head_dim,
+        kv_heads=model_def.kv_heads,
+    )
 
-        return loss, {
-            'loss': loss,
-            'cross_entropy': ce,
-            'ppl': jnp.exp(ce),
-            'accuracy': acc,
-            'entropy_per_token': ent_avg,
-            'trained_tokens_per_seq': jnp.mean(jnp.sum(mask, axis=-1)),
-        }
+    # Accumulators
+    grad_accum0 = jax.tree.map(jnp.zeros_like, train_state.params)
+    nll_sum0     = jnp.array(0.0, dtype=jnp.float32)
+    correct_sum0 = jnp.array(0.0, dtype=jnp.float32)
+    ent_sum0     = jnp.array(0.0, dtype=jnp.float32)
 
-    grads, info = jax.grad(loss_fn, has_aux=True)(train_state.params)
-    updates, opt_state = train_state.tx.update(grads, train_state.opt_state, train_state.params)
-    new_params = optax.apply_updates(train_state.params, updates)
+    def body(i, carry):
+        params, opt_state, cache, grad_accum, nll_sum, correct_sum, ent_sum = carry
+        s = i * chunk_len
 
-    info['grad_norm'] = optax.global_norm(grads)
-    info['update_norm'] = optax.global_norm(updates)
-    info['param_norm'] = optax.global_norm(new_params)
+        x_chunk = jax.lax.dynamic_slice_in_dim(text_in_p,  s, chunk_len, axis=1)   # [B, C]
+        y_chunk = jax.lax.dynamic_slice_in_dim(text_tgt_p, s, chunk_len, axis=1)   # [B, C]
+        m_chunk = jax.lax.dynamic_slice_in_dim(mask_p,     s, chunk_len, axis=1)   # [B, C]
+        attn_chunk = (x_chunk != pad_id).astype(jnp.int32)
+
+        # Only differentiate w.r.t. params; cache is carried across chunks
+        def loss_and_aux(p, c):
+            logits, c_out = train_state.call_model(x_chunk, attn_chunk, cache=c, params=p)  # [B, C, V]
+            logits_f32 = logits.astype(jnp.float32)
+
+            # Per-token CE; normalize by total denom for exact equivalence
+            ce_tok = optax.softmax_cross_entropy_with_integer_labels(logits_f32, y_chunk)  # [B, C]
+            loss_chunk = jnp.sum(ce_tok * m_chunk) / denom_total
+
+            # Metrics
+            preds = jnp.argmax(logits_f32, axis=-1)  # [B, C]
+            correct = jnp.sum((preds == y_chunk) * m_chunk)
+
+            logsumexp = jax.nn.logsumexp(logits_f32, axis=-1, keepdims=True)
+            log_probs = logits_f32 - logsumexp
+            probs = jnp.exp(log_probs)
+            entropy = -jnp.sum(probs * log_probs, axis=-1)  # [B, C]
+            ent_sum_chunk = jnp.sum(entropy * m_chunk)
+
+            nll_sum_chunk = jnp.sum(ce_tok * m_chunk)
+            return loss_chunk, (c_out, nll_sum_chunk, correct, ent_sum_chunk)
+
+        (loss_chunk, (cache_out, nll_sum_chunk, correct_chunk, ent_sum_chunk)), grads = \
+            jax.value_and_grad(loss_and_aux, argnums=0, has_aux=True)(params, cache)
+
+        grad_accum = jax.tree.map(lambda a, g: a + g, grad_accum, grads)
+        nll_sum    = nll_sum + nll_sum_chunk
+        correct_sum = correct_sum + correct_chunk
+        ent_sum    = ent_sum + ent_sum_chunk
+        return (params, opt_state, cache_out, grad_accum, nll_sum, correct_sum, ent_sum)
+
+    params0, opt_state0 = train_state.params, train_state.opt_state
+    params_f, opt_state_f, cache_f, grad_accum_f, nll_sum_f, correct_sum_f, ent_sum_f = \
+        jax.lax.fori_loop(0, steps, body, (params0, opt_state0, cache0, grad_accum0, nll_sum0, correct_sum0, ent_sum0))
+
+    # One optimizer update using accumulated gradients (already normalized by denom_total)
+    updates, opt_state_new = train_state.tx.update(grad_accum_f, opt_state0, params0)
+    new_params = optax.apply_updates(params0, updates)
+
+    # Final metrics over original tokens
+    ce = nll_sum_f / denom_total
+    ppl = jnp.exp(ce)
+    acc = correct_sum_f / denom_total
+    ent_avg = ent_sum_f / denom_total
+
+    info = {
+        'loss': ce,
+        'cross_entropy': ce,
+        'ppl': ppl,
+        'accuracy': acc,
+        'entropy_per_token': ent_avg,
+        'trained_tokens_per_seq': trained_tokens_per_seq,
+        'grad_norm': optax.global_norm(grad_accum_f),
+        'update_norm': optax.global_norm(updates),
+        'param_norm': optax.global_norm(new_params),
+    }
 
     new_state = train_state.replace(
         params=new_params,
-        opt_state=opt_state,
+        opt_state=opt_state_new,
         step=train_state.step + 1,
     )
     return new_state, info
+
+def sft_update_step(train_state: TrainState, token_batch, loss_mask, chunk_len: int = 4096):
+    # Prepare inputs (host side), keep compute-heavy part inside the jitted core.
+    text_in = token_batch[:, :-1]             # [B, T]
+    text_tgt = token_batch[:, 1:]             # [B, T]
+    mask = loss_mask[:, 1:]                   # [B, T]
+    B, T = text_in.shape
+
+    steps = (T + chunk_len - 1) // chunk_len
+    pad_len = steps * chunk_len - T
+
+    if pad_len > 0:
+        def pad2(x, val):
+            return jnp.pad(x, ((0, 0), (0, pad_len)), constant_values=val)
+        text_in_p  = pad2(text_in, pad_id)
+        text_tgt_p = pad2(text_tgt, 0)
+        mask_p     = pad2(mask.astype(jnp.float32), 0.0)
+    else:
+        text_in_p, text_tgt_p, mask_p = text_in, text_tgt, mask.astype(jnp.float32)
+
+    return _sft_update_step_core(train_state, text_in_p, text_tgt_p, mask_p, chunk_len=chunk_len)
 
 @jax.jit
 def sft_eval_step(train_state: TrainState, token_batch, loss_mask):
@@ -454,7 +532,7 @@ for step in tqdm.tqdm(range(FLAGS.train_steps), disable=(host_id != 0)):
     tokens = shard_data_fn(jnp.array(tokens_np))
     mask = shard_data_fn(jnp.array(mask_np))
 
-    train_state, info = sft_update_step(train_state, tokens, mask)
+    train_state, info = sft_update_step(train_state, tokens, mask, FLAGS.sft_update_step_chunk_size)
     info = jax.device_get(info)
     info = jax.tree.map(lambda x: np.array(x), info)
     info = jax.tree.map(lambda x: x.mean(), info)  # average across devices
